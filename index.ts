@@ -1,7 +1,9 @@
+import * as p from "@clack/prompts";
 import { getDb, upsertProjects, upsertTasks, getStats, getValidUsers, deleteUser, getCachedToken, saveToken, closeDb } from "./db/index.ts";
 import { DidaClient } from "./dida/client.ts";
+import type { LoginCallbacks } from "./dida/client.ts";
 import type { UserConfig } from "./types.ts";
-import { ask, askPassword, select } from "./cli.ts";
+import { displayQr } from "./utils/qr.ts";
 
 // ─── 参数解析 ──────────────────────────────────────────
 
@@ -19,105 +21,164 @@ function parseArgs() {
 function cachedToUserConfig(c: { user_id: string; extra: any; expires_at: number }): UserConfig {
   return {
     id: c.user_id,
-    label: c.extra?.username ?? c.user_id,
+    label: c.extra?.displayName ?? c.extra?.username ?? c.user_id,
     authType: c.extra?.authType,
     username: c.extra?.username,
     password: c.extra?.password,
   };
 }
 
+/** Ctrl+C 检查，取消时优雅退出 */
+function exitIfCancelled(value: unknown): asserts value is Exclude<typeof value, symbol> {
+  if (p.isCancel(value)) {
+    p.cancel("已取消");
+    closeDb();
+    process.exit(0);
+  }
+}
+
 // ─── 交互式菜单 ────────────────────────────────────────
 
-async function interactiveMode(): Promise<{ user: UserConfig; isNew: boolean }> {
+async function interactiveMode(): Promise<{ user: UserConfig; isNew: boolean } | null> {
   const cached = getValidUsers();
 
-  const items: { label: string; user: UserConfig }[] = [];
-
-  for (const c of cached) {
+  type Item = { value: string; label: string; hint: string; user: UserConfig };
+  const items: Item[] = cached.map(c => {
     const authLabel = c.extra?.authType === "wechat" ? "微信" : "密码";
     const name = c.extra?.displayName ?? c.extra?.username ?? c.user_id;
     const days = Math.ceil((c.expires_at - Date.now() / 1000) / 86400);
-    items.push({
-      label: `${name} (${authLabel}, ${days}天有效)`,
+    return {
+      value: c.user_id,
+      label: String(name),
+      hint: `${authLabel}, ${days}天有效`,
       user: cachedToUserConfig(c),
-    });
-  }
+    };
+  });
 
   if (items.length > 0) {
-    const options = [...items.map(i => i.label), "添加新用户", "删除用户"];
-    const choice = await select("\n请选择操作: ", options);
+    const choice = await p.select({
+      message: "请选择操作",
+      options: [
+        ...items.map(i => ({ value: i.value, label: i.label, hint: i.hint })),
+        { value: "__add__", label: "添加新用户" },
+        { value: "__delete__", label: "删除用户" },
+      ],
+    });
+    exitIfCancelled(choice);
 
-    if (choice <= items.length) {
-      return { user: items[choice - 1]!.user, isNew: false };
-    }
-
-    if (choice === items.length + 2) {
+    if (choice === "__delete__") {
       await deleteUserMenu(items);
       return interactiveMode();
     }
+
+    if (choice !== "__add__") {
+      const selected = items.find(i => i.value === choice);
+      if (selected) return { user: selected.user, isNew: false };
+    }
   } else {
-    console.log("\n暂无已保存的用户，请添加:");
+    p.log.info("暂无已保存的用户，请添加");
   }
 
-  return { user: await addNewUser(), isNew: true };
+  const user = await addNewUser();
+  return user ? { user, isNew: true } : null;
 }
 
-async function deleteUserMenu(items: { label: string; user: UserConfig }[]) {
-  const options = [...items.map(i => i.label), "取消"];
-  const choice = await select("\n选择要删除的用户: ", options);
+async function deleteUserMenu(items: { value: string; label: string; user: UserConfig }[]) {
+  const choice = await p.select({
+    message: "选择要删除的用户",
+    options: [
+      ...items.map(i => ({ value: i.value, label: i.label })),
+      { value: "__cancel__", label: "取消" },
+    ],
+  });
+  exitIfCancelled(choice);
+  if (choice === "__cancel__") return;
 
-  if (choice > items.length) return; // 取消
+  const target = items.find(i => i.value === choice);
+  if (!target) return;
 
-  const target = items[choice - 1]!;
-  const confirm = await ask(`确认删除 "${target.user.label}" 的所有数据? (y/N): `);
-  if (confirm.toLowerCase() !== "y") {
-    console.log("  已取消");
+  const confirmed = await p.confirm({ message: `确认删除「${target.label}」的所有数据？` });
+  exitIfCancelled(confirmed);
+  if (!confirmed) {
+    p.log.info("已取消");
     return;
   }
 
-  deleteUser(target.user.id);
-  console.log(`  已删除用户: ${target.user.label} (${target.user.id})`);
+  deleteUser(target.value);
+  p.log.success(`已删除: ${target.label} (${target.value})`);
 }
 
-async function addNewUser(): Promise<UserConfig> {
-  console.log("\n请选择登录方式:");
-  const choice = await select("请输入选项: ", [
-    "手机号/邮箱登录",
-    "微信扫码登录",
-  ]);
+async function addNewUser(): Promise<UserConfig | null> {
+  const authType = await p.select({
+    message: "请选择登录方式",
+    options: [
+      { value: "password" as const, label: "手机号/邮箱登录" },
+      { value: "wechat" as const, label: "微信扫码登录" },
+    ],
+  });
+  exitIfCancelled(authType);
 
-  if (choice === 2) {
-    const label = await ask("备注名称 (可选，直接回车跳过): ");
-    return { id: "wechat", label: label || "微信用户", authType: "wechat" };
+  if (authType === "wechat") {
+    const label = await p.text({ message: "备注名称", placeholder: "可选，直接回车跳过" });
+    exitIfCancelled(label);
+    return { id: "wechat", label: (label as string) || "微信用户", authType: "wechat" };
   }
 
-  const username = await ask("手机号/邮箱: ");
-  const password = await askPassword("密码: ");
-  const label = await ask("备注名称 (可选，直接回车跳过): ");
+  const result = await p.group({
+    username: () => p.text({ message: "手机号/邮箱", validate: v => !v ? "请输入" : undefined }),
+    password: () => p.password({ message: "密码", validate: v => !v ? "请输入" : undefined }),
+    label: () => p.text({ message: "备注名称", placeholder: "可选，直接回车跳过" }),
+  }, { onCancel: () => { p.cancel("已取消"); closeDb(); process.exit(0); } });
+
   return {
-    id: username,
-    label: label || username,
+    id: result.username,
+    label: result.label || result.username,
     authType: "password",
-    username,
-    password,
+    username: result.username,
+    password: result.password,
+  };
+}
+
+// ─── 微信扫码回调（终端 QR + spinner） ─────────────────
+
+function createWechatCallbacks(s: ReturnType<typeof p.spinner>): LoginCallbacks {
+  return {
+    async onQrUrl(imageUrl, qrData) {
+      s.stop("获取二维码成功");
+      try {
+        await displayQr(qrData);
+      } catch {
+        p.log.warn(`终端渲染失败，请打开链接扫码: ${imageUrl}`);
+      }
+    },
+    onScanWaiting() { s.start("等待微信扫码..."); },
+    onScanScanned() { s.message("已扫码，等待确认..."); },
+    onScanConfirmed() { s.stop("微信授权成功"); },
   };
 }
 
 // ─── 数据导出 ──────────────────────────────────────────
 
 async function exportUser(user: UserConfig, forceLogin = false) {
-  console.log(`\n--- ${user.label} (${user.id}) ---\n`);
-
   const client = new DidaClient(user);
+  const s = p.spinner();
 
-  console.log("1. 登录中...");
-  await client.login(forceLogin);
-  console.log("  登录成功。");
+  // 1. 登录
+  s.start("登录中...");
+  try {
+    const callbacks = user.authType === "wechat" ? createWechatCallbacks(s) : undefined;
+    await client.login(forceLogin, callbacks);
+    if (!callbacks) s.stop("登录成功");
+  } catch (e) {
+    s.stop("登录失败");
+    throw e;
+  }
 
-  console.log("2. 获取用户信息...");
+  // 2. 获取用户信息
+  s.start("获取用户信息...");
   try {
     const profile = await client.getUserProfile();
-    console.log(`  用户: ${profile.displayName || profile.name} (${profile.username})`);
+    s.stop(`用户: ${profile.displayName || profile.name} (${profile.username})`);
 
     if (forceLogin && profile.userCode) {
       // 新用户：通过 userCode 检查是否已存在
@@ -128,12 +189,13 @@ async function exportUser(user: UserConfig, forceLogin = false) {
 
       if (duplicate) {
         const name = duplicate.extra?.displayName ?? duplicate.extra?.username ?? duplicate.user_id;
-        console.log(`\n  该用户已登录为: ${name} (${duplicate.user_id})`);
-        const choice = await ask("  直接使用已有账户？(Y/n): ");
+        p.log.warn(`该用户已登录为: ${name} (${duplicate.user_id})`);
+        const useExisting = await p.confirm({ message: "直接使用已有账户？" });
+        exitIfCancelled(useExisting);
 
-        if (choice.toLowerCase() === "n") {
+        if (!useExisting) {
           deleteUser(user.id);
-          console.log("  已取消");
+          p.log.info("已取消");
           return;
         }
 
@@ -148,7 +210,6 @@ async function exportUser(user: UserConfig, forceLogin = false) {
         user.id = duplicate.user_id;
         user.label = String(name);
         client.updateUserId(duplicate.user_id);
-        console.log(`  已切换到已有账户`);
       } else if (user.authType === "wechat" && profile.username && profile.username !== user.id) {
         // 微信新用户：用真实用户名替换占位ID
         const oldId = user.id;
@@ -162,7 +223,7 @@ async function exportUser(user: UserConfig, forceLogin = false) {
         deleteUser(oldId);
         user.id = profile.username;
         client.updateUserId(profile.username);
-        console.log(`  用户ID: ${oldId} → ${profile.username}`);
+        p.log.step(`用户ID: ${oldId} → ${profile.username}`);
       } else {
         // 密码新用户：补充 userCode
         const cached = getCachedToken(user.id);
@@ -184,53 +245,61 @@ async function exportUser(user: UserConfig, forceLogin = false) {
       }
     }
   } catch (e) {
-    console.error(`  获取用户信息失败: ${e}`);
+    s.stop("获取用户信息失败");
+    p.log.error(String(e));
   }
 
-  console.log("3. 获取项目和活跃任务...");
+  // 3. 项目和活跃任务
+  s.start("获取项目和活跃任务...");
   const batch = await client.getBatchData();
   const projects = batch.projectProfiles;
   const activeTasks = batch.syncTaskBean?.update ?? [];
-  console.log(`  项目: ${projects.length}，活跃任务: ${activeTasks.length}`);
-
   upsertProjects(user.id, projects);
   upsertTasks(user.id, activeTasks);
+  s.stop(`项目: ${projects.length}，活跃任务: ${activeTasks.length}`);
 
-  console.log("4. 获取已完成任务...");
+  // 4. 已完成任务
+  s.start("获取已完成任务...");
   try {
     const completed = await client.getCompletedTasks();
     upsertTasks(user.id, completed);
-    console.log(`  已完成: ${completed.length}`);
+    s.stop(`已完成: ${completed.length}`);
   } catch (e) {
-    console.error(`  失败: ${e}`);
+    s.stop("获取已完成任务失败");
   }
 
-  console.log("5. 获取已放弃任务...");
+  // 5. 已放弃任务
+  s.start("获取已放弃任务...");
   try {
     const abandoned = await client.getAbandonedTasks();
     upsertTasks(user.id, abandoned);
-    console.log(`  已放弃: ${abandoned.length}`);
+    s.stop(`已放弃: ${abandoned.length}`);
   } catch (e) {
-    console.error(`  失败: ${e}`);
+    s.stop("获取已放弃任务失败");
   }
 
-  console.log("6. 获取垃圾桶任务...");
+  // 6. 垃圾桶任务
+  s.start("获取垃圾桶任务...");
   try {
     const trash = await client.getTrashTasks();
     upsertTasks(user.id, trash);
-    console.log(`  垃圾桶: ${trash.length}`);
+    s.stop(`垃圾桶: ${trash.length}`);
   } catch (e) {
-    console.error(`  失败: ${e}`);
+    s.stop("获取垃圾桶任务失败");
   }
 
+  // 统计
   const stats = getStats(user.id);
-  console.log(`\n  项目: ${stats.projects} | 未完成: ${stats.active} | 已完成: ${stats.completed} | 已放弃: ${stats.abandoned} | 总计: ${stats.total}`);
+  p.note(
+    `项目: ${stats.projects}  未完成: ${stats.active}  已完成: ${stats.completed}  已放弃: ${stats.abandoned}  总计: ${stats.total}`,
+    "导出统计"
+  );
 }
 
 // ─── 主流程 ────────────────────────────────────────────
 
 async function main() {
-  console.log("=== 滴答清单数据导出 ===");
+  p.intro("滴答清单数据导出");
 
   const { userFilter } = parseArgs();
 
@@ -243,7 +312,7 @@ async function main() {
     if (userFilter.length === 0) {
       // --user all
       if (!allCached.length) {
-        console.error("数据库中没有已缓存的用户，请先交互登录");
+        p.log.error("数据库中没有已缓存的用户，请先交互登录");
         process.exit(1);
       }
       for (const c of allCached) {
@@ -254,7 +323,7 @@ async function main() {
       for (const id of userFilter) {
         const cached = getCachedToken(id);
         if (!cached) {
-          console.error(`未找到用户: ${id}，请先交互登录`);
+          p.log.error(`未找到用户: ${id}，请先交互登录`);
           continue;
         }
         await exportUser(cachedToUserConfig({
@@ -264,16 +333,21 @@ async function main() {
     }
   } else {
     // 交互模式（默认）
-    const { user, isNew } = await interactiveMode();
-    await exportUser(user, isNew);
+    const result = await interactiveMode();
+    if (!result) {
+      p.cancel("已取消");
+      closeDb();
+      return;
+    }
+    await exportUser(result.user, result.isNew);
   }
 
   closeDb();
-  console.log("\n=== 导出完成 → db/dida.db ===");
+  p.outro("导出完成 → db/dida.db");
 }
 
 main().catch((err) => {
-  console.error("导出失败:", err);
+  p.log.error(`导出失败: ${err}`);
   closeDb();
   process.exit(1);
 });

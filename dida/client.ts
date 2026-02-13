@@ -6,6 +6,14 @@ import { getCachedToken, saveToken } from "../db/index.ts";
 
 const V2_BASE = "https://api.dida365.com/api/v2";
 
+/** 微信扫码登录进度回调 */
+export interface LoginCallbacks {
+  onQrUrl?(imageUrl: string, qrData: string): Promise<void>;
+  onScanWaiting?(): void;
+  onScanScanned?(): void;
+  onScanConfirmed?(): void;
+}
+
 /** 从 Set-Cookie 中解析 token 对应的过期时间戳（秒） */
 function parseCookieExpiry(cookies: string[]): number | null {
   const now = Math.floor(Date.now() / 1000);
@@ -63,7 +71,7 @@ export class DidaClient {
   // ─── 认证 ────────────────────────────────────────────
 
   /** 登录（自动从 SQLite 读缓存，过期则重新登录） */
-  async login(forceLogin = false): Promise<void> {
+  async login(forceLogin = false, callbacks?: LoginCallbacks): Promise<void> {
     if (!forceLogin) {
       const cached = getCachedToken(this.userId);
       if (cached) {
@@ -77,7 +85,7 @@ export class DidaClient {
 
     const authType = this.user.authType ?? "password";
     if (authType === "wechat") {
-      return this.wechatLogin();
+      return this.wechatLogin(callbacks);
     }
     return this.passwordLogin();
   }
@@ -114,7 +122,7 @@ export class DidaClient {
   }
 
   /** 微信扫码登录 */
-  private async wechatLogin(): Promise<void> {
+  private async wechatLogin(callbacks?: LoginCallbacks): Promise<void> {
     // 1. 获取二维码页面，提取 UUID
     const qrPageUrl = "https://open.weixin.qq.com/connect/qrconnect?"
       + "appid=wxf1429a73d311aad4"
@@ -129,15 +137,20 @@ export class DidaClient {
     if (!uuidMatch) throw new Error("无法从页面提取微信二维码 UUID");
     const uuid = uuidMatch[1];
 
-    // 2. 在浏览器中打开二维码
+    // 2. 显示二维码
     const qrImageUrl = `https://open.weixin.qq.com/connect/qrcode/${uuid}`;
-    console.log(`\n  请使用微信扫描二维码登录:`);
-    console.log(`  ${qrImageUrl}\n`);
-    Bun.spawn(["open", qrImageUrl]);
+    const qrData = `https://open.weixin.qq.com/connect/confirm?uuid=${uuid}`;
+    if (callbacks?.onQrUrl) {
+      await callbacks.onQrUrl(qrImageUrl, qrData);
+    } else {
+      console.log(`\n  请使用微信扫描二维码登录:`);
+      console.log(`  ${qrImageUrl}\n`);
+    }
 
     // 3. 轮询扫码状态（超时 5 分钟）
     const deadline = Date.now() + 5 * 60 * 1000;
     let code: string | null = null;
+    callbacks?.onScanWaiting?.();
 
     while (!code) {
       if (Date.now() > deadline) throw new Error("微信扫码超时（5分钟）");
@@ -153,9 +166,9 @@ export class DidaClient {
         const codeMatch = text.match(/wx_code='([^']+)'/);
         if (!codeMatch?.[1]) throw new Error("微信授权成功但未获取到 code");
         code = codeMatch[1];
-        console.log("  微信授权成功");
+        callbacks?.onScanConfirmed?.();
       } else if (errCode === 404) {
-        console.log("  已扫码，等待确认...");
+        callbacks?.onScanScanned?.();
       } else if (errCode === 408) {
         // 等待扫码，继续轮询
       } else if (errCode === 402 || errCode === 403) {

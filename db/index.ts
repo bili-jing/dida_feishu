@@ -75,6 +75,10 @@ function initSchema(db: Database) {
     )
   `);
 
+  // 迁移：给旧 tokens 表加 expires_at 列，并回填默认值
+  try { db.run(`ALTER TABLE tokens ADD COLUMN expires_at INTEGER`); } catch {}
+  db.run(`UPDATE tokens SET expires_at = created_at + 2592000 WHERE expires_at IS NULL`);
+
   // 索引：加速常用查询
   db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_user_status ON tasks (user_id, status)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_user_project ON tasks (user_id, project_id)`);
@@ -163,24 +167,48 @@ export function upsertTasks(userId: string, tasks: Task[]) {
 
 // ─── Token 缓存 ──────────────────────────────────────
 
-export function getCachedToken(userId: string): { token: string; extra: any; created_at: number } | null {
+export function getCachedToken(userId: string): { token: string; extra: any; created_at: number; expires_at: number } | null {
   const row = getDb().query(
-    `SELECT token, extra, created_at FROM tokens WHERE user_id = ?`
+    `SELECT token, extra, created_at, expires_at FROM tokens WHERE user_id = ?`
   ).get(userId) as any;
   if (!row) return null;
   return {
     token: row.token,
     extra: row.extra ? JSON.parse(row.extra) : null,
     created_at: row.created_at,
+    expires_at: row.expires_at ?? (row.created_at + 86400),
   };
 }
 
-export function saveToken(userId: string, token: string, extra: any) {
+export function saveToken(userId: string, token: string, extra: any, expiresAt?: number) {
+  const now = Math.floor(Date.now() / 1000);
   getDb().run(`
-    INSERT INTO tokens (user_id, token, extra, created_at) VALUES (?, ?, ?, ?)
+    INSERT INTO tokens (user_id, token, extra, created_at, expires_at) VALUES (?, ?, ?, ?, ?)
     ON CONFLICT (user_id) DO UPDATE SET
-      token = excluded.token, extra = excluded.extra, created_at = excluded.created_at
-  `, [userId, token, extra ? JSON.stringify(extra) : null, Math.floor(Date.now() / 1000)]);
+      token = excluded.token, extra = excluded.extra,
+      created_at = excluded.created_at, expires_at = excluded.expires_at
+  `, [userId, token, extra ? JSON.stringify(extra) : null, now, expiresAt ?? (now + 30 * 86400)]);
+}
+
+/** 获取所有未过期的缓存用户 */
+export function getValidUsers(): { user_id: string; extra: any; expires_at: number }[] {
+  const now = Math.floor(Date.now() / 1000);
+  return (getDb().query(
+    `SELECT user_id, extra, expires_at FROM tokens WHERE expires_at > ? ORDER BY created_at DESC`
+  ).all(now) as any[]).map(r => ({
+    user_id: r.user_id,
+    extra: r.extra ? JSON.parse(r.extra) : null,
+    expires_at: r.expires_at,
+  }));
+}
+
+/** 删除用户的所有数据（token + 项目 + 任务 + 同步状态） */
+export function deleteUser(userId: string) {
+  const db = getDb();
+  db.run(`DELETE FROM tokens WHERE user_id = ?`, [userId]);
+  db.run(`DELETE FROM projects WHERE user_id = ?`, [userId]);
+  db.run(`DELETE FROM tasks WHERE user_id = ?`, [userId]);
+  db.run(`DELETE FROM sync_state WHERE user_id = ?`, [userId]);
 }
 
 // ─── 统计 ─────────────────────────────────────────────

@@ -1,0 +1,195 @@
+import * as lark from "@larksuiteoapi/node-sdk";
+
+const FEISHU_APP_ID = Bun.env.FEISHU_APP_ID!;
+const FEISHU_APP_SECRET = Bun.env.FEISHU_APP_SECRET!;
+
+let _client: lark.Client | null = null;
+
+export function getFeishuClient(): lark.Client {
+  if (!_client) {
+    if (!FEISHU_APP_ID || !FEISHU_APP_SECRET) {
+      throw new Error("请在 .env 中配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET");
+    }
+    _client = new lark.Client({
+      appId: FEISHU_APP_ID,
+      appSecret: FEISHU_APP_SECRET,
+      domain: lark.Domain.Feishu,
+    });
+  }
+  return _client;
+}
+
+/** 延迟，避免限流 */
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ─── Bitable 操作 ─────────────────────────────────────
+
+export interface BitableField {
+  field_name: string;
+  type: number;
+  property?: any;
+}
+
+/** 创建多维表格 */
+export async function createBitable(name: string, folderToken?: string) {
+  const client = getFeishuClient();
+  const res = await client.bitable.app.create({
+    data: {
+      name,
+      folder_token: folderToken,
+      time_zone: "Asia/Shanghai",
+    },
+  });
+  if (res.code !== 0) throw new Error(`创建多维表格失败: ${res.msg}`);
+  return res.data!.app!;
+}
+
+/** 创建数据表（含字段定义） */
+export async function createTable(
+  appToken: string,
+  tableName: string,
+  fields: BitableField[]
+) {
+  const client = getFeishuClient();
+  const res = await client.bitable.appTable.create({
+    data: {
+      table: {
+        name: tableName,
+        default_view_name: "全部任务",
+        fields: fields as any,
+      },
+    },
+    path: { app_token: appToken },
+  });
+  if (res.code !== 0) throw new Error(`创建数据表失败: ${res.msg}`);
+  return {
+    tableId: res.data!.table_id!,
+    defaultViewId: res.data!.default_view_id,
+    fieldIds: res.data!.field_id_list,
+  };
+}
+
+/** 创建视图 */
+export async function createView(
+  appToken: string,
+  tableId: string,
+  viewName: string,
+  viewType: string
+) {
+  const client = getFeishuClient();
+  const res = await client.bitable.appTableView.create({
+    data: {
+      view_name: viewName,
+      view_type: viewType,
+    },
+    path: { app_token: appToken, table_id: tableId },
+  });
+  if (res.code !== 0) throw new Error(`创建视图失败: ${res.msg}`);
+  return res.data!.view!;
+}
+
+/** 批量创建记录（每批最多 500 条） */
+export async function batchCreateRecords(
+  appToken: string,
+  tableId: string,
+  records: Array<{ fields: Record<string, any> }>
+) {
+  const client = getFeishuClient();
+  const results: any[] = [];
+
+  // 分批处理，每批 500 条
+  for (let i = 0; i < records.length; i += 500) {
+    const batch = records.slice(i, i + 500);
+    const res = await client.bitable.appTableRecord.batchCreate({
+      data: { records: batch },
+      path: { app_token: appToken, table_id: tableId },
+    });
+    if (res.code !== 0) throw new Error(`批量创建记录失败: ${res.msg}`);
+    results.push(...(res.data!.records ?? []));
+
+    if (i + 500 < records.length) await sleep(300); // 避免限流
+  }
+
+  return results;
+}
+
+/** 获取多维表格信息 */
+export async function getBitableInfo(appToken: string) {
+  const client = getFeishuClient();
+  const res = await client.bitable.app.get({
+    path: { app_token: appToken },
+  });
+  if (res.code !== 0) throw new Error(`获取多维表格信息失败: ${res.msg}`);
+  return res.data!.app!;
+}
+
+// ─── 文档操作 ─────────────────────────────────────────
+
+/** 创建文档 */
+export async function createDocument(title: string, folderToken?: string) {
+  const client = getFeishuClient();
+  const res = await client.docx.document.create({
+    data: { title, folder_token: folderToken },
+  });
+  if (res.code !== 0) throw new Error(`创建文档失败: ${res.msg}`);
+  return res.data!.document!;
+}
+
+/** 向文档添加内容块 */
+export async function addDocumentBlocks(
+  documentId: string,
+  blockId: string,
+  children: any[],
+  index?: number
+) {
+  const client = getFeishuClient();
+  const res = await client.docx.documentBlockChildren.create({
+    data: {
+      children,
+      index,
+    },
+    params: {
+      document_revision_id: -1,
+    },
+    path: {
+      document_id: documentId,
+      block_id: blockId,
+    },
+  });
+  if (res.code !== 0) throw new Error(`添加文档内容失败: ${res.msg}`);
+  return res.data!;
+}
+
+// ─── 云空间操作 ──────────────────────────────────────
+
+/** 创建文件夹 */
+export async function createFolder(name: string, parentFolderToken: string) {
+  const client = getFeishuClient();
+  const res = await client.drive.file.createFolder({
+    data: { name, folder_token: parentFolderToken },
+  });
+  if (res.code !== 0) throw new Error(`创建文件夹失败: ${res.msg}`);
+  return res.data!;
+}
+
+/** 列出文件夹内容 */
+export async function listFiles(folderToken: string) {
+  const client = getFeishuClient();
+  const res = await client.drive.file.list({
+    params: { folder_token: folderToken, page_size: 50 },
+  });
+  if (res.code !== 0) throw new Error(`列出文件失败: ${res.msg}`);
+  return res.data!.files ?? [];
+}
+
+/** 获取根文件夹 token */
+export async function getRootFolderToken() {
+  const client = getFeishuClient();
+  const res = await client.drive.file.list({
+    params: { folder_token: "", page_size: 1 },
+  });
+  // 根文件夹可以通过创建文件夹在空 folder_token 下来使用
+  return "";
+}

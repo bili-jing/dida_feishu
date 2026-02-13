@@ -2,8 +2,9 @@
 export interface UserConfig {
   id: string;
   label: string;
-  username: string;
-  password: string;
+  authType?: "password" | "wechat";
+  username?: string;
+  password?: string;
 }
 
 /** 项目/清单 */

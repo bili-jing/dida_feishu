@@ -6,6 +6,23 @@ import { getCachedToken, saveToken } from "../db/index.ts";
 
 const V2_BASE = "https://api.dida365.com/api/v2";
 
+/** 从 Set-Cookie 中解析 token 对应的过期时间戳（秒） */
+function parseCookieExpiry(cookies: string[]): number | null {
+  const now = Math.floor(Date.now() / 1000);
+  for (const cookie of cookies) {
+    // 跳过非 t= 或空值的 cookie（如 t=""; 删除 cookie）
+    if (!cookie.startsWith("t=") || cookie.startsWith('t="";') || cookie.startsWith("t=;")) continue;
+    const maxAge = cookie.match(/Max-Age=(\d+)/i);
+    if (maxAge?.[1]) return now + parseInt(maxAge[1]);
+    const expires = cookie.match(/Expires=([^;]+)/i);
+    if (expires?.[1]) {
+      const ts = new Date(expires[1]).getTime();
+      if (!isNaN(ts) && ts / 1000 > now) return Math.floor(ts / 1000);
+    }
+  }
+  return null;
+}
+
 const BROWSER_HEADERS: Record<string, string> = {
   "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
   "Accept": "*/*",
@@ -46,14 +63,29 @@ export class DidaClient {
   // ─── 认证 ────────────────────────────────────────────
 
   /** 登录（自动从 SQLite 读缓存，过期则重新登录） */
-  async login(): Promise<void> {
-    const cached = getCachedToken(this.userId);
-    if (cached) {
-      const now = Math.floor(Date.now() / 1000);
-      if (now < cached.created_at + 86400) {
-        this.token = cached.token;
-        return;
+  async login(forceLogin = false): Promise<void> {
+    if (!forceLogin) {
+      const cached = getCachedToken(this.userId);
+      if (cached) {
+        const now = Math.floor(Date.now() / 1000);
+        if (now < cached.expires_at) {
+          this.token = cached.token;
+          return;
+        }
       }
+    }
+
+    const authType = this.user.authType ?? "password";
+    if (authType === "wechat") {
+      return this.wechatLogin();
+    }
+    return this.passwordLogin();
+  }
+
+  /** 密码登录 */
+  private async passwordLogin(): Promise<void> {
+    if (!this.user.username || !this.user.password) {
+      throw new Error("密码登录需要 username 和 password");
     }
 
     const isPhone = /^\d+$/.test(this.user.username);
@@ -73,7 +105,120 @@ export class DidaClient {
 
     const data = await res.json() as { token: string; userId: string; inboxId: string };
     this.token = data.token;
-    saveToken(this.userId, data.token, { userId: data.userId, inboxId: data.inboxId });
+    const expiresAt = parseCookieExpiry(res.headers.getSetCookie());
+    saveToken(this.userId, data.token, {
+      userId: data.userId, inboxId: data.inboxId,
+      authType: "password", username: this.user.username,
+      password: this.user.password,
+    }, expiresAt ?? undefined);
+  }
+
+  /** 微信扫码登录 */
+  private async wechatLogin(): Promise<void> {
+    // 1. 获取二维码页面，提取 UUID
+    const qrPageUrl = "https://open.weixin.qq.com/connect/qrconnect?"
+      + "appid=wxf1429a73d311aad4"
+      + "&redirect_uri=" + encodeURIComponent("https://dida365.com/sign/wechat")
+      + "&response_type=code&scope=snsapi_login&state=Lw==";
+
+    const pageRes = await fetch(qrPageUrl);
+    if (!pageRes.ok) throw new Error(`获取微信二维码页面失败: ${pageRes.status}`);
+    const html = await pageRes.text();
+
+    const uuidMatch = html.match(/\/connect\/qrcode\/([a-zA-Z0-9_-]+)/);
+    if (!uuidMatch) throw new Error("无法从页面提取微信二维码 UUID");
+    const uuid = uuidMatch[1];
+
+    // 2. 在浏览器中打开二维码
+    const qrImageUrl = `https://open.weixin.qq.com/connect/qrcode/${uuid}`;
+    console.log(`\n  请使用微信扫描二维码登录:`);
+    console.log(`  ${qrImageUrl}\n`);
+    Bun.spawn(["open", qrImageUrl]);
+
+    // 3. 轮询扫码状态（超时 5 分钟）
+    const deadline = Date.now() + 5 * 60 * 1000;
+    let code: string | null = null;
+
+    while (!code) {
+      if (Date.now() > deadline) throw new Error("微信扫码超时（5分钟）");
+
+      const pollUrl = `https://long.open.weixin.qq.com/connect/l/qrconnect?uuid=${uuid}&_=${Date.now()}`;
+      const pollRes = await fetch(pollUrl);
+      const text = await pollRes.text();
+
+      const errCodeMatch = text.match(/wx_errcode=(\d+)/);
+      const errCode = errCodeMatch?.[1] ? parseInt(errCodeMatch[1]) : 0;
+
+      if (errCode === 405) {
+        const codeMatch = text.match(/wx_code='([^']+)'/);
+        if (!codeMatch?.[1]) throw new Error("微信授权成功但未获取到 code");
+        code = codeMatch[1];
+        console.log("  微信授权成功");
+      } else if (errCode === 404) {
+        console.log("  已扫码，等待确认...");
+      } else if (errCode === 408) {
+        // 等待扫码，继续轮询
+      } else if (errCode === 402 || errCode === 403) {
+        throw new Error("二维码已过期，请重试");
+      }
+    }
+
+    // 4. 用 code 向滴答验证，获取 token
+    //    validate 可能返回 302 重定向，需手动跟随并收集整条链上的所有 cookie
+    const validateUrl = `${V2_BASE}/user/sign/wechat/validate?code=${encodeURIComponent(code)}&state=Lw==`;
+    const allCookies: string[] = [];
+
+    let res = await fetch(validateUrl, {
+      headers: BROWSER_HEADERS,
+      redirect: "manual",
+    });
+    allCookies.push(...res.headers.getSetCookie());
+
+    // 手动跟随重定向链（最多 5 跳），收集每一跳的 Set-Cookie
+    let hops = 0;
+    while (res.status >= 300 && res.status < 400 && hops < 5) {
+      const location = res.headers.get("location");
+      if (!location) break;
+      const nextUrl = location.startsWith("http") ? location : new URL(location, validateUrl).href;
+      const cookieHeader = allCookies.map(c => c.split(";")[0]).join("; ");
+      res = await fetch(nextUrl, {
+        headers: { ...BROWSER_HEADERS, Cookie: cookieHeader },
+        redirect: "manual",
+      });
+      allCookies.push(...res.headers.getSetCookie());
+      hops++;
+    }
+
+    // 从所有 cookie 中提取 token（跳过 t="" 删除 cookie，取最后一个有效 t=）
+    let token: string | null = null;
+    let tokenCookies: string[] = [];
+    for (const cookie of allCookies) {
+      if (cookie.startsWith('t="";') || cookie.startsWith("t=;")) continue;
+      const match = cookie.match(/^t=([^;]+)/);
+      if (match?.[1]) {
+        token = match[1];
+        tokenCookies = allCookies;
+      }
+    }
+
+    // 兜底：从最终响应体取
+    if (!token) {
+      try {
+        const body = await res.json() as Record<string, any>;
+        if (body.token) token = body.token as string;
+      } catch {}
+    }
+
+    if (!token) throw new Error("微信登录验证失败：未获取到 token");
+
+    this.token = token;
+    const expiresAt = parseCookieExpiry(tokenCookies);
+    saveToken(this.userId, token, { authType: "wechat" }, expiresAt ?? undefined);
+  }
+
+  /** 更新用户ID（微信登录后获取到真实ID时使用） */
+  updateUserId(newId: string) {
+    this.userId = newId;
   }
 
   // ─── 通用请求 ────────────────────────────────────────

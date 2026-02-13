@@ -26,6 +26,55 @@ Content-Type: application/json
 { "token": "xxx", "userId": "xxx", "inboxId": "inbox123" }
 ```
 
+### 微信扫码登录
+
+完整流程共 4 步：
+
+**1. 获取二维码**
+
+```
+GET https://open.weixin.qq.com/connect/qrconnect
+  ?appid=wxf1429a73d311aad4
+  &redirect_uri=https://dida365.com/sign/wechat
+  &response_type=code
+  &scope=snsapi_login
+  &state=Lw==
+```
+
+从返回的 HTML 中提取 UUID：`<img src="/connect/qrcode/{uuid}">`
+
+二维码图片地址：`https://open.weixin.qq.com/connect/qrcode/{uuid}`
+
+**2. 轮询扫码状态**
+
+```
+GET https://long.open.weixin.qq.com/connect/l/qrconnect?uuid={uuid}&_={timestamp}
+```
+
+响应为 JavaScript：
+- `wx_errcode=408` — 等待扫码
+- `wx_errcode=404` — 已扫码，等待确认
+- `wx_errcode=405` — 已确认，`wx_code` 包含授权码
+- `wx_errcode=402/403` — 二维码过期
+
+```javascript
+window.wx_errcode=405;window.wx_code='AUTH_CODE_HERE';
+```
+
+**3. 用授权码验证**
+
+```
+GET /user/sign/wechat/validate?code={code}&state=Lw==
+```
+
+**4. 获取 token**
+
+token 在响应的 `Set-Cookie` 头中：
+
+```
+Set-Cookie: t={token}; Domain=.dida365.com; ...
+```
+
 ## 用户
 
 ### 获取用户资料

@@ -39,3 +39,4 @@ db/*.db
 db/*.db-shm
 db/*.db-wal
 .playwright-mcp
+dida-export

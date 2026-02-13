@@ -8,5 +8,8 @@
   },
   "peerDependencies": {
     "typescript": "^5"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.59.0"
   }
 }

@@ -63,6 +63,10 @@ const BROWSER_HEADERS: Record<string, string> = {
 export class DidaClient {
   private token: string | null = null;
   private userId: string;
+  /** getBatchData 后缓存的项目 ID 列表 */
+  private cachedProjectIds: string[] = [];
+  /** getBatchData 后缓存的收集箱 ID */
+  private cachedInboxId: string | null = null;
 
   constructor(private user: UserConfig) {
     this.userId = user.id;
@@ -271,42 +275,103 @@ export class DidaClient {
 
   // ─── 任务 ────────────────────────────────────────────
 
-  /** 获取全量数据：项目 + 活跃任务 + 标签 */
+  /** 获取全量数据：项目 + 活跃任务 + 标签（同时缓存项目列表供后续使用） */
   async getBatchData(): Promise<BatchCheckResponse> {
-    return this.request<BatchCheckResponse>("/batch/check/0");
+    const data = await this.request<BatchCheckResponse>("/batch/check/0");
+    this.cachedProjectIds = data.projectProfiles.map((p) => p.id);
+    this.cachedInboxId = data.inboxId ?? null;
+    return data;
   }
 
-  /** 获取已关闭任务（已完成/已放弃），自动分页 */
-  private async getClosedTasks(status: "Completed" | "Abandoned"): Promise<Task[]> {
+  /**
+   * 获取已完成任务（按项目逐个获取）
+   *
+   * Dida API 的 `to` 游标分页存在服务端 bug（返回 500），
+   * 因此按项目逐个获取，每个项目独立 limit=5000，更可靠也能拿到更多数据。
+   */
+  async getCompletedTasks(): Promise<Task[]> {
+    const projectIds = await this.getAllProjectIds();
+    const seen = new Set<string>();
     const all: Task[] = [];
-    let cursor: string | undefined;
+    const PER_PROJECT_LIMIT = 5000;
 
-    while (true) {
-      const params: Record<string, string> = { from: "", status };
-      if (cursor) params.to = cursor;
+    for (const projectId of projectIds) {
+      try {
+        const tasks = await this.request<Task[]>(
+          `/project/${projectId}/completed/`,
+          { from: "", limit: String(PER_PROJECT_LIMIT) },
+        );
+        if (!tasks?.length) continue;
 
-      const tasks = await this.request<Task[]>("/project/all/closed", params);
-      if (!tasks?.length) break;
+        for (const t of tasks) {
+          if (!seen.has(t.id)) {
+            seen.add(t.id);
+            all.push(t);
+          }
+        }
 
-      all.push(...tasks);
-
-      if (tasks.length < 50) break;
-      const last = tasks[tasks.length - 1];
-      if (!last?.completedTime) break;
-      cursor = last.completedTime;
+        if (tasks.length >= PER_PROJECT_LIMIT) {
+          console.warn(`  ⚠ 项目 ${projectId} 已完成任务达到 ${PER_PROJECT_LIMIT} 条上限，可能有遗漏`);
+        }
+      } catch {
+        // 单个项目获取失败不影响整体
+      }
     }
 
     return all;
   }
 
-  /** 获取所有已完成任务 */
-  async getCompletedTasks(): Promise<Task[]> {
-    return this.getClosedTasks("Completed");
+  /**
+   * 获取已放弃任务（批量获取，放弃任务通常很少）
+   *
+   * 注意：Dida API 的 `to` 游标分页存在服务端 bug（返回 500），
+   * 因此使用 `limit` 参数大批量获取，避免依赖游标翻页。
+   */
+  async getAbandonedTasks(): Promise<Task[]> {
+    const BATCH_SIZE = 5000;
+    const params: Record<string, string> = { from: "", status: "Abandoned", limit: String(BATCH_SIZE) };
+
+    const tasks = await this.request<Task[]>("/project/all/closed", params);
+    if (!tasks?.length) return [];
+
+    if (tasks.length >= BATCH_SIZE) {
+      console.warn(`  ⚠ 已放弃任务达到 ${BATCH_SIZE} 条上限，可能有遗漏`);
+    }
+
+    return tasks;
   }
 
-  /** 获取所有已放弃任务 */
-  async getAbandonedTasks(): Promise<Task[]> {
-    return this.getClosedTasks("Abandoned");
+  /** 收集所有项目 ID（含收集箱），用于按项目遍历 */
+  private async getAllProjectIds(): Promise<string[]> {
+    // 优先使用 getBatchData 缓存的数据
+    let projectIds = [...this.cachedProjectIds];
+    let inboxId = this.cachedInboxId;
+
+    // 如果没有缓存，重新获取
+    if (!projectIds.length) {
+      const projects = await this.getProjects();
+      projectIds = projects.map((p) => p.id);
+    }
+
+    // 确保收集箱包含在内
+    if (inboxId && !projectIds.includes(inboxId)) {
+      projectIds.unshift(inboxId);
+    }
+
+    // 兜底：从已有活跃任务中提取可能遗漏的 projectId（如收集箱）
+    // 如果 inboxId 未知，尝试通过 getBatchData 的活跃任务推断
+    if (!inboxId) {
+      try {
+        const batch = await this.request<BatchCheckResponse>("/batch/check/0");
+        if (batch.inboxId && !projectIds.includes(batch.inboxId)) {
+          projectIds.unshift(batch.inboxId);
+        }
+      } catch {
+        // 忽略
+      }
+    }
+
+    return projectIds;
   }
 
   /** 获取垃圾桶任务（自动分页） */

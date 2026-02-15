@@ -265,7 +265,7 @@ async function exportUser(user: UserConfig, forceLogin = false) {
     upsertTasks(user.id, completed);
     s.stop(`已完成: ${completed.length}`);
   } catch (e) {
-    s.stop("获取已完成任务失败");
+    s.stop(`获取已完成任务失败: ${e}`);
   }
 
   // 5. 已放弃任务
@@ -275,7 +275,7 @@ async function exportUser(user: UserConfig, forceLogin = false) {
     upsertTasks(user.id, abandoned);
     s.stop(`已放弃: ${abandoned.length}`);
   } catch (e) {
-    s.stop("获取已放弃任务失败");
+    s.stop(`获取已放弃任务失败: ${e}`);
   }
 
   // 6. 垃圾桶任务
@@ -285,7 +285,7 @@ async function exportUser(user: UserConfig, forceLogin = false) {
     upsertTasks(user.id, trash);
     s.stop(`垃圾桶: ${trash.length}`);
   } catch (e) {
-    s.stop("获取垃圾桶任务失败");
+    s.stop(`获取垃圾桶任务失败: ${e}`);
   }
 
   // 统计
@@ -344,6 +344,7 @@ async function main() {
 
   closeDb();
   p.outro("导出完成 → db/dida.db");
+  process.exit(0);
 }
 
 main().catch((err) => {

@@ -1,13 +1,15 @@
 /**
- * 全量同步脚本：从 SQLite 读取滴答任务 → 下载附件 → 上传飞书 → 创建多维表格
+ * 滴答清单 → 飞书多维表格 同步脚本
  *
- * - 下载滴答附件（图片/PDF/DOC等）并缓存到本地
- * - 上传到飞书 Drive，获取 file_token
- * - 创建多维表格，写入全部任务（含附件、子任务、清洗后的内容）
+ * 支持两种模式：
+ * - 全量同步：创建新的多维表格，写入全部任务（首次或 --full）
+ * - 增量同步：检测新增/修改的任务，只更新变化的记录（默认，需已有配置）
  *
  * 用法:
- *   bun run sync.ts                     # 同步所有用户
+ *   bun run sync.ts                     # 自动选择（有配置→增量，无配置→全量）
  *   bun run sync.ts --user <id>         # 同步指定用户
+ *   bun run sync.ts --full              # 强制全量同步（创建新表格）
+ *   bun run sync.ts --no-attachments    # 跳过附件处理
  *   bun run sync.ts --reset             # 清除所有缓存，全量重建
  */
 
@@ -21,8 +23,12 @@ import {
   getFieldMap,
   patchView,
   batchCreateRecords,
+  batchUpdateRecords,
+  getBitableInfo,
   uploadMedia,
   getFeishuClient,
+  setFeishuCredentials,
+  clearFeishuCredentials,
   type BitableField,
 } from "./feishu/client.ts";
 
@@ -572,10 +578,44 @@ async function processAttachments(
   );
 }
 
-// ─── 同步用户 ────────────────────────────────────────
+// ─── DB 查询辅助 ──────────────────────────────────────
 
-async function syncUser(db: Database, userId: string, skipAttachments = false) {
+export function getFeishuConfigFromDb(db: Database, userId: string) {
+  return db
+    .query(`SELECT app_token, table_id, app_url FROM feishu_config WHERE user_id = ?`)
+    .get(userId) as { app_token: string; table_id: string; app_url: string | null } | null;
+}
+
+function getSyncStateMap(db: Database, userId: string) {
+  const rows = db
+    .query(`SELECT dida_task_id, feishu_record_id, last_modified_time FROM sync_state WHERE user_id = ?`)
+    .all(userId) as Array<{ dida_task_id: string; feishu_record_id: string; last_modified_time: string | null }>;
+  const map = new Map<string, { recordId: string; modifiedTime: string | null }>();
+  for (const r of rows) {
+    map.set(r.dida_task_id, { recordId: r.feishu_record_id, modifiedTime: r.last_modified_time });
+  }
+  return map;
+}
+
+// ─── 凭据激活 ─────────────────────────────────────────
+
+/** 从 DB 读取并激活该用户的飞书凭据 */
+function activateUserCredentials(db: Database, userId: string) {
+  const row = db
+    .query(`SELECT app_id, app_secret FROM feishu_credentials WHERE user_id = ?`)
+    .get(userId) as { app_id: string; app_secret: string } | null;
+  if (row) {
+    setFeishuCredentials(row.app_id, row.app_secret);
+  } else {
+    clearFeishuCredentials(); // 回退到 env
+  }
+}
+
+// ─── 全量同步 ─────────────────────────────────────────
+
+export async function fullSyncUser(db: Database, userId: string, skipAttachments = false) {
   console.log(`\n--- 同步用户: ${userId} ---`);
+  activateUserCredentials(db, userId);
 
   // 获取显示名称
   const tokenRow = db
@@ -677,7 +717,7 @@ async function syncUser(db: Database, userId: string, skipAttachments = false) {
       path: { app_token: appToken },
     });
     for (const t of tablesRes.data?.items ?? []) {
-      if (t.table_id !== tableId && t.name === "Table1") {
+      if (t.table_id !== tableId && (t.name === "数据表" || t.name === "Table1")) {
         await client.bitable.appTable.delete({
           path: { app_token: appToken, table_id: t.table_id! },
         });
@@ -722,10 +762,152 @@ async function syncUser(db: Database, userId: string, skipAttachments = false) {
   return { appToken, tableId, appUrl: app.url };
 }
 
+// ─── 增量同步 ─────────────────────────────────────────
+
+export async function incrementalSyncUser(
+  db: Database,
+  userId: string,
+  appToken: string,
+  tableId: string,
+  appUrl: string | null,
+  skipAttachments = false
+) {
+  console.log(`\n--- 增量同步用户: ${userId} ---`);
+  activateUserCredentials(db, userId);
+  console.log(`  飞书链接: ${appUrl ?? "未知"}`);
+
+  // 验证飞书表格是否还存在
+  try {
+    await getBitableInfo(appToken);
+  } catch {
+    console.log("  ⚠ 飞书表格不可访问，将执行全量同步");
+    return null; // 返回 null 表示需要回退到全量
+  }
+
+  const tokenRow = db
+    .query(`SELECT extra, token FROM tokens WHERE user_id = ?`)
+    .get(userId) as { extra: string; token: string } | null;
+  const didaToken = tokenRow?.token;
+
+  // 加载任务
+  const tasks = db
+    .query(
+      `SELECT t.id, t.user_id, t.project_id, t.title, t.content, t."desc",
+              t.status, t.priority, t.start_date, t.due_date,
+              t.completed_time, t.created_time, t.modified_time,
+              t.tags, t.items, t.raw, p.name as project_name
+       FROM tasks t
+       LEFT JOIN projects p ON t.project_id = p.id AND t.user_id = p.user_id
+       WHERE t.user_id = ?
+       ORDER BY t.created_time DESC`
+    )
+    .all(userId) as TaskRow[];
+
+  if (!tasks.length) {
+    console.log("  没有任务需要同步");
+    return { appToken, tableId, appUrl };
+  }
+  console.log(`  本地任务: ${tasks.length} 条`);
+
+  // 加载已有同步状态
+  const syncMap = getSyncStateMap(db, userId);
+  console.log(`  已同步记录: ${syncMap.size} 条`);
+
+  // 分类：新增 / 修改 / 未变
+  const newTasks: TaskRow[] = [];
+  const modifiedTasks: Array<{ task: TaskRow; recordId: string }> = [];
+  let unchanged = 0;
+
+  for (const task of tasks) {
+    const existing = syncMap.get(task.id);
+    if (!existing) {
+      newTasks.push(task);
+    } else if (task.modified_time !== existing.modifiedTime) {
+      modifiedTasks.push({ task, recordId: existing.recordId });
+    } else {
+      unchanged++;
+    }
+  }
+
+  console.log(
+    `  新增: ${newTasks.length} | 修改: ${modifiedTasks.length} | 未变: ${unchanged}`
+  );
+
+  if (newTasks.length === 0 && modifiedTasks.length === 0) {
+    console.log("  无需更新，已是最新");
+    return { appToken, tableId, appUrl };
+  }
+
+  // 处理附件：只处理新增和修改的任务
+  const changedTasks = [...newTasks, ...modifiedTasks.map((m) => m.task)];
+  if (skipAttachments) {
+    console.log("  跳过附件处理 (--no-attachments)");
+  } else if (didaToken) {
+    await processAttachments(db, userId, changedTasks, appToken, didaToken);
+  } else {
+    console.log("  ⚠ 无法获取滴答 token，跳过附件处理");
+  }
+
+  // 创建新记录
+  if (newTasks.length > 0) {
+    console.log(`  创建 ${newTasks.length} 条新记录...`);
+    const newRecords = newTasks.map((task) => {
+      const fileTokens = getTaskFileTokens(db, task.id);
+      return {
+        fields: taskToFields(task, fileTokens.length > 0 ? fileTokens : undefined),
+      };
+    });
+    const created = await batchCreateRecords(appToken, tableId, newRecords);
+    console.log(`  成功创建 ${created.length} 条`);
+
+    // 更新同步状态
+    const syncItems = newTasks.map((t, i) => ({
+      taskId: t.id,
+      recordId: created[i]?.record_id ?? "",
+      modifiedTime: t.modified_time,
+    }));
+    batchUpsertSyncState(db, userId, syncItems);
+  }
+
+  // 更新已有记录
+  if (modifiedTasks.length > 0) {
+    console.log(`  更新 ${modifiedTasks.length} 条记录...`);
+    const updateRecords = modifiedTasks.map(({ task, recordId }) => {
+      const fileTokens = getTaskFileTokens(db, task.id);
+      return {
+        record_id: recordId,
+        fields: taskToFields(task, fileTokens.length > 0 ? fileTokens : undefined),
+      };
+    });
+    const updated = await batchUpdateRecords(appToken, tableId, updateRecords);
+    console.log(`  成功更新 ${updated.length} 条`);
+
+    // 更新同步状态
+    const syncItems = modifiedTasks.map(({ task, recordId }) => ({
+      taskId: task.id,
+      recordId,
+      modifiedTime: task.modified_time,
+    }));
+    batchUpsertSyncState(db, userId, syncItems);
+  }
+
+  console.log(`\n  ✓ 增量同步完成！`);
+  console.log(`  飞书链接: ${appUrl}`);
+  return { appToken, tableId, appUrl };
+}
+
 // ─── 主逻辑 ──────────────────────────────────────────
 
 async function main() {
-  console.log("=== 滴答 → 飞书 全量同步（含附件） ===");
+  const args = process.argv.slice(2);
+  const forceFullSync = args.includes("--full");
+  const skipAttachments = args.includes("--no-attachments");
+
+  console.log(
+    forceFullSync
+      ? "=== 滴答 → 飞书 全量同步（含附件） ==="
+      : "=== 滴答 → 飞书 同步 ==="
+  );
 
   const db = new Database(DB_FILE);
   db.run("PRAGMA journal_mode = WAL");
@@ -754,8 +936,14 @@ async function main() {
       downloaded_at TEXT, uploaded_at TEXT
     )
   `);
-
-  const args = process.argv.slice(2);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS feishu_credentials (
+      user_id TEXT PRIMARY KEY,
+      app_id TEXT NOT NULL, app_secret TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
 
   // --reset: 完全清除（含本地下载缓存）
   if (args.includes("--reset")) {
@@ -765,7 +953,6 @@ async function main() {
     console.log("已清除所有同步配置和附件缓存");
   }
 
-  const skipAttachments = args.includes("--no-attachments");
   const idx = args.indexOf("--user");
   const filterUser = idx !== -1 ? args[idx + 1] : null;
 
@@ -788,7 +975,22 @@ async function main() {
 
   for (const userId of users) {
     try {
-      await syncUser(db, userId, skipAttachments);
+      // 检查是否有已存在的飞书配置
+      const config = forceFullSync ? null : getFeishuConfigFromDb(db, userId);
+
+      if (config) {
+        // 尝试增量同步
+        const result = await incrementalSyncUser(
+          db, userId, config.app_token, config.table_id, config.app_url, skipAttachments
+        );
+        if (result === null) {
+          // 飞书表格不可访问，回退全量同步
+          await fullSyncUser(db, userId, skipAttachments);
+        }
+      } else {
+        // 全量同步
+        await fullSyncUser(db, userId, skipAttachments);
+      }
     } catch (e) {
       console.error(`  同步用户 ${userId} 失败:`, e);
     }
@@ -798,7 +1000,10 @@ async function main() {
   console.log("\n=== 同步完成 ===");
 }
 
-main().catch((err) => {
-  console.error("同步失败:", err);
-  process.exit(1);
-});
+// 仅当直接执行 sync.ts 时运行 main()
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error("同步失败:", err);
+    process.exit(1);
+  });
+}

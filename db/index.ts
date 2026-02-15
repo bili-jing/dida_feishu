@@ -101,6 +101,16 @@ function initSchema(db: Database) {
     )
   `);
 
+  db.run(`
+    CREATE TABLE IF NOT EXISTS feishu_credentials (
+      user_id TEXT PRIMARY KEY,
+      app_id TEXT NOT NULL,
+      app_secret TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+
   // 迁移：给旧 tokens 表加 expires_at 列，并回填默认值
   try { db.run(`ALTER TABLE tokens ADD COLUMN expires_at INTEGER`); } catch {}
   db.run(`UPDATE tokens SET expires_at = created_at + 2592000 WHERE expires_at IS NULL`);
@@ -228,7 +238,7 @@ export function getValidUsers(): { user_id: string; extra: any; expires_at: numb
   }));
 }
 
-/** 删除用户的所有数据（token + 项目 + 任务 + 同步状态 + 飞书配置） */
+/** 删除用户的所有数据（token + 项目 + 任务 + 同步状态 + 飞书配置 + 飞书凭据） */
 export function deleteUser(userId: string) {
   const db = getDb();
   db.run(`DELETE FROM tokens WHERE user_id = ?`, [userId]);
@@ -236,6 +246,7 @@ export function deleteUser(userId: string) {
   db.run(`DELETE FROM tasks WHERE user_id = ?`, [userId]);
   db.run(`DELETE FROM sync_state WHERE user_id = ?`, [userId]);
   db.run(`DELETE FROM feishu_config WHERE user_id = ?`, [userId]);
+  db.run(`DELETE FROM feishu_credentials WHERE user_id = ?`, [userId]);
 }
 
 // ─── 飞书配置 ────────────────────────────────────────
@@ -262,6 +273,35 @@ export function saveFeishuConfig(userId: string, appToken: string, tableId: stri
       app_token = excluded.app_token, table_id = excluded.table_id,
       app_url = excluded.app_url, updated_at = datetime('now')
   `, [userId, appToken, tableId, appUrl ?? null]);
+}
+
+// ─── 飞书凭据（per-user app_id/app_secret） ─────────
+
+export interface FeishuCredentials {
+  user_id: string;
+  app_id: string;
+  app_secret: string;
+}
+
+export function getFeishuCredentials(userId: string): FeishuCredentials | null {
+  const row = getDb().query(
+    `SELECT user_id, app_id, app_secret FROM feishu_credentials WHERE user_id = ?`
+  ).get(userId) as any;
+  return row ?? null;
+}
+
+export function saveFeishuCredentials(userId: string, appId: string, appSecret: string) {
+  getDb().run(`
+    INSERT INTO feishu_credentials (user_id, app_id, app_secret)
+    VALUES (?, ?, ?)
+    ON CONFLICT (user_id) DO UPDATE SET
+      app_id = excluded.app_id, app_secret = excluded.app_secret,
+      updated_at = datetime('now')
+  `, [userId, appId, appSecret]);
+}
+
+export function deleteFeishuCredentials(userId: string) {
+  getDb().run(`DELETE FROM feishu_credentials WHERE user_id = ?`, [userId]);
 }
 
 // ─── 同步状态查询 ────────────────────────────────────
@@ -376,6 +416,110 @@ export function getTaskFileTokens(taskId: string): Array<{ file_token: string; f
 /** 清除用户的附件缓存 */
 export function clearAttachmentCache(userId: string) {
   getDb().run(`DELETE FROM attachment_cache WHERE user_id = ?`, [userId]);
+}
+
+// ─── 同步对比 ─────────────────────────────────────────
+
+export interface SyncComparison {
+  total: number;
+  synced: number;
+  newTasks: number;
+  modified: number;
+  unchanged: number;
+}
+
+/** 对比本地任务与飞书同步状态 */
+export function getSyncComparison(userId: string): SyncComparison {
+  const db = getDb();
+  const total = (db.query(
+    `SELECT COUNT(*) as c FROM tasks WHERE user_id = ?`
+  ).get(userId) as any).c;
+
+  const synced = (db.query(
+    `SELECT COUNT(*) as c FROM sync_state WHERE user_id = ? AND sync_status = 'synced'`
+  ).get(userId) as any).c;
+
+  // 新增：在 tasks 中但不在 sync_state 中
+  const newTasks = (db.query(
+    `SELECT COUNT(*) as c FROM tasks t
+     WHERE t.user_id = ? AND NOT EXISTS (
+       SELECT 1 FROM sync_state s WHERE s.dida_task_id = t.id AND s.user_id = t.user_id
+     )`
+  ).get(userId) as any).c;
+
+  // 修改：modified_time 不一致
+  const modified = (db.query(
+    `SELECT COUNT(*) as c FROM tasks t
+     JOIN sync_state s ON t.id = s.dida_task_id AND t.user_id = s.user_id
+     WHERE t.user_id = ? AND t.modified_time != s.last_modified_time`
+  ).get(userId) as any).c;
+
+  return { total, synced, newTasks, modified, unchanged: synced - modified };
+}
+
+// ─── 任务搜索 ─────────────────────────────────────────
+
+export interface TaskSearchResult {
+  id: string;
+  title: string;
+  status: number;
+  project_name: string | null;
+  modified_time: string | null;
+  sync_status: string | null;  // 'synced' | null (未同步)
+}
+
+/** 搜索任务（标题/内容模糊匹配），返回匹配结果 */
+export function searchTasks(userId: string, keyword: string, limit = 20): TaskSearchResult[] {
+  const pattern = `%${keyword}%`;
+  return getDb().query(
+    `SELECT t.id, t.title, t.status, p.name as project_name, t.modified_time,
+            s.sync_status
+     FROM tasks t
+     LEFT JOIN projects p ON t.project_id = p.id AND t.user_id = p.user_id
+     LEFT JOIN sync_state s ON t.id = s.dida_task_id AND t.user_id = s.user_id
+     WHERE t.user_id = ? AND (t.title LIKE ? OR t.content LIKE ?)
+     ORDER BY t.modified_time DESC
+     LIMIT ?`
+  ).all(userId, pattern, pattern, limit) as TaskSearchResult[];
+}
+
+/** 获取任务详情 */
+export function getTaskDetail(userId: string, taskId: string) {
+  return getDb().query(
+    `SELECT t.*, p.name as project_name, s.sync_status, s.feishu_record_id, s.last_synced_at
+     FROM tasks t
+     LEFT JOIN projects p ON t.project_id = p.id AND t.user_id = p.user_id
+     LEFT JOIN sync_state s ON t.id = s.dida_task_id AND t.user_id = s.user_id
+     WHERE t.user_id = ? AND t.id = ?`
+  ).get(userId, taskId) as any;
+}
+
+/** 获取未同步的任务列表 */
+export function getUnsyncedTasks(userId: string, limit = 20): TaskSearchResult[] {
+  return getDb().query(
+    `SELECT t.id, t.title, t.status, p.name as project_name, t.modified_time,
+            NULL as sync_status
+     FROM tasks t
+     LEFT JOIN projects p ON t.project_id = p.id AND t.user_id = p.user_id
+     WHERE t.user_id = ? AND NOT EXISTS (
+       SELECT 1 FROM sync_state s WHERE s.dida_task_id = t.id AND s.user_id = t.user_id
+     )
+     ORDER BY t.modified_time DESC
+     LIMIT ?`
+  ).all(userId, limit) as TaskSearchResult[];
+}
+
+/** 获取已修改（需重新同步）的任务列表 */
+export function getModifiedTasks(userId: string, limit = 20): TaskSearchResult[] {
+  return getDb().query(
+    `SELECT t.id, t.title, t.status, p.name as project_name, t.modified_time,
+            s.sync_status
+     FROM tasks t
+     JOIN sync_state s ON t.id = s.dida_task_id AND t.user_id = s.user_id
+     WHERE t.user_id = ? AND t.modified_time != s.last_modified_time
+     ORDER BY t.modified_time DESC
+     LIMIT ?`
+  ).all(userId, limit) as TaskSearchResult[];
 }
 
 // ─── 生命周期 ─────────────────────────────────────────

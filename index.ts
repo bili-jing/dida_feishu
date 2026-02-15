@@ -1,9 +1,18 @@
 import * as p from "@clack/prompts";
-import { getDb, upsertProjects, upsertTasks, getStats, getValidUsers, deleteUser, getCachedToken, saveToken, closeDb } from "./db/index.ts";
+import { Database } from "bun:sqlite";
+import {
+  getDb, upsertProjects, upsertTasks, getStats, getValidUsers, deleteUser,
+  getCachedToken, saveToken, closeDb, getFeishuConfig, getSyncComparison,
+  searchTasks, getTaskDetail, getUnsyncedTasks, getModifiedTasks,
+  getFeishuCredentials, saveFeishuCredentials, deleteFeishuCredentials,
+  type TaskSearchResult,
+} from "./db/index.ts";
 import { DidaClient } from "./dida/client.ts";
 import type { LoginCallbacks } from "./dida/client.ts";
 import type { UserConfig } from "./types.ts";
 import { displayQr } from "./utils/qr.ts";
+import { fullSyncUser, incrementalSyncUser } from "./sync.ts";
+import { setFeishuCredentials, clearFeishuCredentials } from "./feishu/client.ts";
 
 // ─── 参数解析 ──────────────────────────────────────────
 
@@ -37,9 +46,25 @@ function exitIfCancelled(value: unknown): asserts value is Exclude<typeof value,
   }
 }
 
-// ─── 交互式菜单 ────────────────────────────────────────
+// ─── 状态文字辅助 ──────────────────────────────────────
 
-async function interactiveMode(): Promise<{ user: UserConfig; isNew: boolean } | null> {
+function statusLabel(status: number): string {
+  switch (status) {
+    case 0: return "进行中";
+    case 2: return "已完成";
+    case -1: return "已放弃";
+    default: return "未知";
+  }
+}
+
+function truncate(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  return text.slice(0, maxLen - 1) + "…";
+}
+
+// ─── 主菜单：选择/添加/删除用户 ─────────────────────────
+
+async function mainMenu(): Promise<{ user: UserConfig; isNew: boolean } | null> {
   const cached = getValidUsers();
 
   type Item = { value: string; label: string; hint: string; user: UserConfig };
@@ -57,7 +82,7 @@ async function interactiveMode(): Promise<{ user: UserConfig; isNew: boolean } |
 
   if (items.length > 0) {
     const choice = await p.select({
-      message: "请选择操作",
+      message: "请选择用户",
       options: [
         ...items.map(i => ({ value: i.value, label: i.label, hint: i.hint })),
         { value: "__add__", label: "添加新用户" },
@@ -68,7 +93,7 @@ async function interactiveMode(): Promise<{ user: UserConfig; isNew: boolean } |
 
     if (choice === "__delete__") {
       await deleteUserMenu(items);
-      return interactiveMode();
+      return mainMenu();
     }
 
     if (choice !== "__add__") {
@@ -139,7 +164,7 @@ async function addNewUser(): Promise<UserConfig | null> {
   };
 }
 
-// ─── 微信扫码回调（终端 QR + spinner） ─────────────────
+// ─── 微信扫码回调 ──────────────────────────────────────
 
 function createWechatCallbacks(s: ReturnType<typeof p.spinner>): LoginCallbacks {
   return {
@@ -157,9 +182,9 @@ function createWechatCallbacks(s: ReturnType<typeof p.spinner>): LoginCallbacks 
   };
 }
 
-// ─── 数据导出 ──────────────────────────────────────────
+// ─── 数据拉取 ──────────────────────────────────────────
 
-async function exportUser(user: UserConfig, forceLogin = false) {
+async function fetchData(user: UserConfig, forceLogin = false) {
   const client = new DidaClient(user);
   const s = p.spinner();
 
@@ -174,14 +199,13 @@ async function exportUser(user: UserConfig, forceLogin = false) {
     throw e;
   }
 
-  // 2. 获取用户信息
+  // 2. 获取用户信息 + 去重处理
   s.start("获取用户信息...");
   try {
     const profile = await client.getUserProfile();
     s.stop(`用户: ${profile.displayName || profile.name} (${profile.username})`);
 
     if (forceLogin && profile.userCode) {
-      // 新用户：通过 userCode 检查是否已存在
       const existingUsers = getValidUsers();
       const duplicate = existingUsers.find(u =>
         u.extra?.userCode === profile.userCode && u.user_id !== user.id
@@ -196,10 +220,9 @@ async function exportUser(user: UserConfig, forceLogin = false) {
         if (!useExisting) {
           deleteUser(user.id);
           p.log.info("已取消");
-          return;
+          return null;
         }
 
-        // 用新 token 更新已有账户，清理临时数据
         const newToken = getCachedToken(user.id);
         if (newToken) {
           saveToken(duplicate.user_id, newToken.token, {
@@ -211,7 +234,6 @@ async function exportUser(user: UserConfig, forceLogin = false) {
         user.label = String(name);
         client.updateUserId(duplicate.user_id);
       } else if (user.authType === "wechat" && profile.username && profile.username !== user.id) {
-        // 微信新用户：用真实用户名替换占位ID
         const oldId = user.id;
         const cached = getCachedToken(oldId);
         if (cached) {
@@ -225,7 +247,6 @@ async function exportUser(user: UserConfig, forceLogin = false) {
         client.updateUserId(profile.username);
         p.log.step(`用户ID: ${oldId} → ${profile.username}`);
       } else {
-        // 密码新用户：补充 userCode
         const cached = getCachedToken(user.id);
         if (cached) {
           saveToken(user.id, cached.token, {
@@ -235,7 +256,6 @@ async function exportUser(user: UserConfig, forceLogin = false) {
         }
       }
     } else if (profile.userCode) {
-      // 已有用户：首次补充 userCode
       const cached = getCachedToken(user.id);
       if (cached && !cached.extra?.userCode) {
         saveToken(user.id, cached.token, {
@@ -249,7 +269,10 @@ async function exportUser(user: UserConfig, forceLogin = false) {
     p.log.error(String(e));
   }
 
-  // 3. 项目和活跃任务
+  // 3. 拉取前的统计（用于对比）
+  const beforeStats = getStats(user.id);
+
+  // 4. 项目和活跃任务
   s.start("获取项目和活跃任务...");
   const batch = await client.getBatchData();
   const projects = batch.projectProfiles;
@@ -258,7 +281,7 @@ async function exportUser(user: UserConfig, forceLogin = false) {
   upsertTasks(user.id, activeTasks);
   s.stop(`项目: ${projects.length}，活跃任务: ${activeTasks.length}`);
 
-  // 4. 已完成任务
+  // 5. 已完成任务
   s.start("获取已完成任务...");
   try {
     const completed = await client.getCompletedTasks();
@@ -268,7 +291,7 @@ async function exportUser(user: UserConfig, forceLogin = false) {
     s.stop(`获取已完成任务失败: ${e}`);
   }
 
-  // 5. 已放弃任务
+  // 6. 已放弃任务
   s.start("获取已放弃任务...");
   try {
     const abandoned = await client.getAbandonedTasks();
@@ -278,7 +301,7 @@ async function exportUser(user: UserConfig, forceLogin = false) {
     s.stop(`获取已放弃任务失败: ${e}`);
   }
 
-  // 6. 垃圾桶任务
+  // 7. 垃圾桶任务
   s.start("获取垃圾桶任务...");
   try {
     const trash = await client.getTrashTasks();
@@ -288,67 +311,567 @@ async function exportUser(user: UserConfig, forceLogin = false) {
     s.stop(`获取垃圾桶任务失败: ${e}`);
   }
 
-  // 统计
-  const stats = getStats(user.id);
-  p.note(
-    `项目: ${stats.projects}  未完成: ${stats.active}  已完成: ${stats.completed}  已放弃: ${stats.abandoned}  总计: ${stats.total}`,
-    "导出统计"
-  );
+  // 8. 统计对比
+  const afterStats = getStats(user.id);
+  const diff = afterStats.total - beforeStats.total;
+
+  let summary = `项目: ${afterStats.projects}  未完成: ${afterStats.active}  已完成: ${afterStats.completed}  已放弃: ${afterStats.abandoned}  总计: ${afterStats.total}`;
+  if (beforeStats.total > 0 && diff > 0) {
+    summary += `\n新增: +${diff} 条`;
+  }
+  p.note(summary, "数据概况");
+
+  return user;
+}
+
+// ─── 数据概况 ──────────────────────────────────────────
+
+function showDataOverview(userId: string) {
+  const stats = getStats(userId);
+  const feishuConfig = getFeishuConfig(userId);
+  const comparison = feishuConfig ? getSyncComparison(userId) : null;
+
+  let info = `项目: ${stats.projects}  未完成: ${stats.active}  已完成: ${stats.completed}  已放弃: ${stats.abandoned}  总计: ${stats.total}`;
+
+  if (comparison) {
+    info += `\n\n飞书同步状态:`;
+    info += `\n  已同步: ${comparison.synced}  未同步: ${comparison.newTasks}  已修改: ${comparison.modified}  未变: ${comparison.unchanged}`;
+    if (feishuConfig?.app_url) {
+      info += `\n  链接: ${feishuConfig.app_url}`;
+    }
+  } else {
+    info += `\n\n尚未同步到飞书`;
+  }
+
+  p.note(info, "数据概况");
+}
+
+// ─── 搜索功能 ──────────────────────────────────────────
+
+function formatTaskItem(t: TaskSearchResult): { value: string; label: string; hint: string } {
+  const syncIcon = t.sync_status === "synced" ? "✓" : "○";
+  const statusIcon = t.status === 2 ? "✓" : t.status === -1 ? "✗" : "●";
+  return {
+    value: t.id,
+    label: `${statusIcon} ${truncate(t.title, 40)}`,
+    hint: `${syncIcon} ${t.project_name || "收集箱"} · ${statusLabel(t.status)}`,
+  };
+}
+
+async function searchMenu(userId: string) {
+  while (true) {
+    const keyword = await p.text({
+      message: "搜索任务（标题/内容）",
+      placeholder: "输入关键词，直接回车返回",
+    });
+    exitIfCancelled(keyword);
+
+    if (!keyword) return; // 空回车 = 返回
+
+    const results = searchTasks(userId, keyword as string);
+
+    if (results.length === 0) {
+      p.log.warn("未找到匹配的任务");
+      continue;
+    }
+
+    p.log.info(`找到 ${results.length} 条结果 (✓=已同步 ○=未同步)`);
+
+    const choice = await p.select({
+      message: "选择查看详情",
+      options: [
+        ...results.map(formatTaskItem),
+        { value: "__back__", label: "← 继续搜索" },
+      ],
+    });
+    exitIfCancelled(choice);
+
+    if (choice === "__back__") continue;
+
+    // 显示任务详情
+    await showTaskDetail(userId, choice as string);
+  }
+}
+
+async function showTaskDetail(userId: string, taskId: string) {
+  const task = getTaskDetail(userId, taskId);
+  if (!task) {
+    p.log.error("未找到该任务");
+    return;
+  }
+
+  const lines: string[] = [];
+  lines.push(`标题: ${task.title}`);
+  lines.push(`状态: ${statusLabel(task.status)}  清单: ${task.project_name || "收集箱"}`);
+
+  if (task.content) {
+    const content = task.content.length > 200 ? task.content.slice(0, 200) + "..." : task.content;
+    lines.push(`内容: ${content}`);
+  }
+
+  if (task.tags) {
+    try {
+      const tags = JSON.parse(task.tags);
+      if (tags.length) lines.push(`标签: ${tags.join(", ")}`);
+    } catch {}
+  }
+
+  if (task.created_time) lines.push(`创建: ${task.created_time}`);
+  if (task.modified_time) lines.push(`修改: ${task.modified_time}`);
+
+  lines.push("");
+  if (task.sync_status === "synced") {
+    lines.push(`同步状态: 已同步`);
+    if (task.last_synced_at) lines.push(`同步时间: ${task.last_synced_at}`);
+  } else {
+    lines.push(`同步状态: 未同步`);
+  }
+
+  p.note(lines.join("\n"), "任务详情");
+}
+
+// ─── 查看未同步/已修改 ─────────────────────────────────
+
+async function viewPendingTasks(userId: string) {
+  const comparison = getSyncComparison(userId);
+
+  if (comparison.newTasks === 0 && comparison.modified === 0) {
+    p.log.success("所有任务已同步，无待处理项");
+    return;
+  }
+
+  const options: Array<{ value: string; label: string; hint: string }> = [];
+
+  if (comparison.newTasks > 0) {
+    options.push({
+      value: "new",
+      label: `未同步的任务`,
+      hint: `${comparison.newTasks} 条`,
+    });
+  }
+  if (comparison.modified > 0) {
+    options.push({
+      value: "modified",
+      label: `已修改的任务`,
+      hint: `${comparison.modified} 条`,
+    });
+  }
+  options.push({ value: "__back__", label: "← 返回" });
+
+  const choice = await p.select({ message: "查看待处理任务", options });
+  exitIfCancelled(choice);
+  if (choice === "__back__") return;
+
+  const tasks = choice === "new" ? getUnsyncedTasks(userId, 50) : getModifiedTasks(userId, 50);
+  const title = choice === "new" ? "未同步" : "已修改";
+
+  if (tasks.length === 0) {
+    p.log.info("没有待处理的任务");
+    return;
+  }
+
+  const taskChoice = await p.select({
+    message: `${title}的任务 (${tasks.length} 条)`,
+    options: [
+      ...tasks.map(formatTaskItem),
+      { value: "__back__", label: "← 返回" },
+    ],
+  });
+  exitIfCancelled(taskChoice);
+
+  if (taskChoice !== "__back__") {
+    await showTaskDetail(userId, taskChoice as string);
+  }
+}
+
+// ─── 飞书配置管理 ─────────────────────────────────────
+
+/** 激活用户的飞书凭据（设置到 client） */
+function activateFeishuCredentials(userId: string): boolean {
+  const creds = getFeishuCredentials(userId);
+  if (creds) {
+    setFeishuCredentials(creds.app_id, creds.app_secret);
+    return true;
+  }
+  // 尝试 env 回退
+  if (Bun.env.FEISHU_APP_ID && Bun.env.FEISHU_APP_SECRET) {
+    clearFeishuCredentials();
+    return true;
+  }
+  return false;
+}
+
+/** 绑定飞书凭据流程 */
+async function bindFeishu(userId: string): Promise<boolean> {
+  p.log.info("请在飞书开放平台创建应用，获取 App ID 和 App Secret");
+  p.log.info("地址: https://open.feishu.cn/app");
+
+  const appId = await p.text({
+    message: "飞书 App ID",
+    validate: v => !v ? "请输入 App ID" : undefined,
+  });
+  exitIfCancelled(appId);
+
+  const appSecret = await p.text({
+    message: "飞书 App Secret",
+    validate: v => !v ? "请输入 App Secret" : undefined,
+  });
+  exitIfCancelled(appSecret);
+
+  // 验证凭据是否有效
+  const s = p.spinner();
+  s.start("验证飞书凭据...");
+  try {
+    setFeishuCredentials(appId as string, appSecret as string);
+    const { getFeishuClient } = await import("./feishu/client.ts");
+    const client = getFeishuClient();
+    // 尝试一个简单的 API 调用来验证
+    await client.drive.file.list({ params: { folder_token: "", page_size: 1 } });
+    s.stop("飞书凭据验证成功");
+  } catch (e) {
+    s.stop("飞书凭据验证失败");
+    p.log.error(`验证失败: ${(e as Error).message}`);
+    p.log.warn("请检查 App ID 和 App Secret 是否正确，以及应用是否已开通相关权限");
+    clearFeishuCredentials();
+    return false;
+  }
+
+  saveFeishuCredentials(userId, appId as string, appSecret as string);
+  p.log.success("飞书凭据已保存");
+  return true;
+}
+
+async function feishuConfigMenu(userId: string) {
+  const creds = getFeishuCredentials(userId);
+  const feishuConfig = getFeishuConfig(userId);
+
+  if (creds) {
+    // 已绑定 → 显示状态，提供换绑/解绑
+    let info = `App ID: ${creds.app_id.slice(0, 6)}...${creds.app_id.slice(-4)}`;
+    if (feishuConfig?.app_url) {
+      info += `\n飞书链接: ${feishuConfig.app_url}`;
+    }
+    p.note(info, "当前飞书配置");
+
+    const choice = await p.select({
+      message: "飞书配置操作",
+      options: [
+        { value: "rebind", label: "换绑", hint: "更换飞书应用凭据" },
+        { value: "unbind", label: "解绑", hint: "移除飞书凭据" },
+        { value: "__back__", label: "← 返回" },
+      ],
+    });
+    exitIfCancelled(choice);
+
+    if (choice === "rebind") {
+      await bindFeishu(userId);
+    } else if (choice === "unbind") {
+      const confirmed = await p.confirm({ message: "确认解绑飞书？解绑后需重新配置才能同步" });
+      exitIfCancelled(confirmed);
+      if (confirmed) {
+        deleteFeishuCredentials(userId);
+        clearFeishuCredentials();
+        p.log.success("已解绑飞书");
+      }
+    }
+  } else {
+    // 未绑定 → 直接引导绑定
+    await bindFeishu(userId);
+  }
+}
+
+// ─── 同步到飞书 ───────────────────────────────────────
+
+async function syncToFeishu(userId: string) {
+  // 检查飞书凭据
+  if (!activateFeishuCredentials(userId)) {
+    p.log.warn("尚未绑定飞书应用，需要先配置飞书凭据才能同步");
+    const doBind = await p.confirm({ message: "现在绑定飞书？" });
+    exitIfCancelled(doBind);
+    if (!doBind) return;
+    const ok = await bindFeishu(userId);
+    if (!ok) return;
+  }
+
+  const feishuConfig = getFeishuConfig(userId);
+  const comparison = feishuConfig ? getSyncComparison(userId) : null;
+  const DB_FILE = "./db/dida.db";
+
+  if (feishuConfig && comparison) {
+    // 已有飞书配置 → 显示同步状态
+    let info = `飞书链接: ${feishuConfig.app_url ?? "未知"}`;
+    info += `\n已同步: ${comparison.synced}  新增: ${comparison.newTasks}  修改: ${comparison.modified}`;
+
+    if (comparison.newTasks === 0 && comparison.modified === 0) {
+      p.note(info + "\n\n所有数据已是最新", "同步状态");
+      const force = await p.confirm({ message: "是否强制全量重建？", initialValue: false });
+      exitIfCancelled(force);
+      if (!force) return;
+
+      // 全量重建
+      const db = new Database(DB_FILE);
+      db.run("PRAGMA journal_mode = WAL");
+      try {
+        const s = p.spinner();
+        s.start("全量同步中...");
+        await fullSyncUser(db, userId, false);
+        s.stop("全量同步完成");
+      } finally {
+        db.close();
+      }
+      return;
+    }
+
+    p.note(info, "同步状态");
+
+    const syncChoice = await p.select({
+      message: "选择同步方式",
+      options: [
+        { value: "incremental", label: "增量同步", hint: `更新 ${comparison.newTasks + comparison.modified} 条` },
+        { value: "full", label: "全量重建", hint: "创建新表格，重新上传所有数据" },
+        { value: "__back__", label: "← 返回" },
+      ],
+    });
+    exitIfCancelled(syncChoice);
+    if (syncChoice === "__back__") return;
+
+    const skipAtt = await p.confirm({ message: "是否跳过附件？", initialValue: false });
+    exitIfCancelled(skipAtt);
+
+    const db = new Database(DB_FILE);
+    db.run("PRAGMA journal_mode = WAL");
+    try {
+      const s = p.spinner();
+      if (syncChoice === "incremental") {
+        s.start(`增量同步中 (新增: ${comparison.newTasks}, 修改: ${comparison.modified})...`);
+        const result = await incrementalSyncUser(
+          db, userId, feishuConfig.app_token, feishuConfig.table_id, feishuConfig.app_url, skipAtt as boolean
+        );
+        if (result === null) {
+          s.stop("飞书表格不可访问，切换全量同步");
+          s.start("全量同步中...");
+          await fullSyncUser(db, userId, skipAtt as boolean);
+          s.stop("全量同步完成");
+        } else {
+          s.stop("增量同步完成");
+        }
+      } else {
+        s.start("全量同步中...");
+        await fullSyncUser(db, userId, skipAtt as boolean);
+        s.stop("全量同步完成");
+      }
+    } finally {
+      db.close();
+    }
+  } else {
+    // 没有飞书配置 → 首次全量同步
+    p.log.info("尚未同步到飞书，将执行首次全量同步");
+    const confirm = await p.confirm({ message: "开始全量同步？" });
+    exitIfCancelled(confirm);
+    if (!confirm) return;
+
+    const skipAtt = await p.confirm({ message: "是否跳过附件？", initialValue: false });
+    exitIfCancelled(skipAtt);
+
+    const db = new Database(DB_FILE);
+    db.run("PRAGMA journal_mode = WAL");
+    try {
+      const s = p.spinner();
+      s.start("全量同步中...");
+      await fullSyncUser(db, userId, skipAtt as boolean);
+      s.stop("全量同步完成");
+    } finally {
+      db.close();
+    }
+  }
+
+  // 同步完成后显示最新状态
+  const newConfig = getFeishuConfig(userId);
+  if (newConfig?.app_url) {
+    p.log.success(`飞书链接: ${newConfig.app_url}`);
+  }
+}
+
+// ─── 用户操作菜单 ──────────────────────────────────────
+
+async function userMenu(user: UserConfig, isNew: boolean) {
+  // 新用户或首次进入时拉取数据
+  if (isNew) {
+    const updated = await fetchData(user, true);
+    if (!updated) return; // 用户取消
+    user = updated;
+
+    // 新用户提示绑定飞书
+    if (!getFeishuCredentials(user.id)) {
+      const hasEnv = !!(Bun.env.FEISHU_APP_ID && Bun.env.FEISHU_APP_SECRET);
+      if (!hasEnv) {
+        const doBind = await p.confirm({
+          message: "是否绑定飞书应用？绑定后可将任务同步到飞书多维表格",
+          initialValue: false,
+        });
+        exitIfCancelled(doBind);
+        if (doBind) {
+          await bindFeishu(user.id);
+        }
+      }
+    }
+  }
+
+  // 激活该用户的飞书凭据
+  activateFeishuCredentials(user.id);
+
+  while (true) {
+    const stats = getStats(user.id);
+    const feishuConfig = getFeishuConfig(user.id);
+    const comparison = feishuConfig ? getSyncComparison(user.id) : null;
+
+    // 构建菜单选项
+    const options: Array<{ value: string; label: string; hint?: string }> = [];
+
+    options.push({
+      value: "fetch",
+      label: "拉取最新数据",
+      hint: `本地 ${stats.total} 条`,
+    });
+
+    options.push({
+      value: "overview",
+      label: "数据概况",
+    });
+
+    options.push({
+      value: "search",
+      label: "搜索任务",
+    });
+
+    if (comparison && (comparison.newTasks > 0 || comparison.modified > 0)) {
+      options.push({
+        value: "pending",
+        label: "待同步任务",
+        hint: `新增 ${comparison.newTasks} + 修改 ${comparison.modified}`,
+      });
+    }
+
+    if (feishuConfig) {
+      const syncHint = comparison
+        ? (comparison.newTasks + comparison.modified > 0
+            ? `${comparison.newTasks + comparison.modified} 条待更新`
+            : "已是最新")
+        : "";
+      options.push({
+        value: "sync",
+        label: "同步到飞书",
+        hint: syncHint,
+      });
+    } else {
+      options.push({
+        value: "sync",
+        label: "同步到飞书",
+        hint: "首次同步",
+      });
+    }
+
+    const creds = getFeishuCredentials(user.id);
+    options.push({
+      value: "feishu_config",
+      label: "飞书配置",
+      hint: creds ? `已绑定 (${creds.app_id.slice(0, 6)}...)` : "未绑定",
+    });
+
+    options.push({
+      value: "__back__",
+      label: "← 返回主菜单",
+    });
+
+    const choice = await p.select({
+      message: `${user.label} - 操作`,
+      options,
+    });
+    exitIfCancelled(choice);
+
+    switch (choice) {
+      case "fetch":
+        await fetchData(user);
+        break;
+      case "overview":
+        showDataOverview(user.id);
+        break;
+      case "search":
+        await searchMenu(user.id);
+        break;
+      case "pending":
+        await viewPendingTasks(user.id);
+        break;
+      case "sync":
+        await syncToFeishu(user.id);
+        break;
+      case "feishu_config":
+        await feishuConfigMenu(user.id);
+        break;
+      case "__back__":
+        return;
+    }
+  }
+}
+
+// ─── 非交互模式 ───────────────────────────────────────
+
+async function batchMode(userFilter: string[]) {
+  const allCached = getValidUsers();
+
+  if (userFilter.length === 0) {
+    // --user all
+    if (!allCached.length) {
+      p.log.error("数据库中没有已缓存的用户，请先交互登录");
+      process.exit(1);
+    }
+    for (const c of allCached) {
+      await fetchData(cachedToUserConfig(c));
+    }
+  } else {
+    // --user id1,id2
+    for (const id of userFilter) {
+      const cached = getCachedToken(id);
+      if (!cached) {
+        p.log.error(`未找到用户: ${id}，请先交互登录`);
+        continue;
+      }
+      await fetchData(cachedToUserConfig({
+        user_id: id, extra: cached.extra, expires_at: cached.expires_at,
+      }));
+    }
+  }
 }
 
 // ─── 主流程 ────────────────────────────────────────────
 
 async function main() {
-  p.intro("滴答清单数据导出");
+  p.intro("滴答清单数据管理");
 
   const { userFilter } = parseArgs();
-
   getDb();
 
   if (userFilter) {
-    // 非交互：--user id1,id2 或 --user all
-    const allCached = getValidUsers();
-
-    if (userFilter.length === 0) {
-      // --user all
-      if (!allCached.length) {
-        p.log.error("数据库中没有已缓存的用户，请先交互登录");
-        process.exit(1);
-      }
-      for (const c of allCached) {
-        await exportUser(cachedToUserConfig(c));
-      }
-    } else {
-      // --user id1,id2
-      for (const id of userFilter) {
-        const cached = getCachedToken(id);
-        if (!cached) {
-          p.log.error(`未找到用户: ${id}，请先交互登录`);
-          continue;
-        }
-        await exportUser(cachedToUserConfig({
-          user_id: id, extra: cached.extra, expires_at: cached.expires_at,
-        }));
-      }
-    }
+    await batchMode(userFilter);
   } else {
-    // 交互模式（默认）
-    const result = await interactiveMode();
-    if (!result) {
-      p.cancel("已取消");
-      closeDb();
-      return;
+    // 交互模式：主菜单循环
+    while (true) {
+      const result = await mainMenu();
+      if (!result) {
+        p.cancel("已取消");
+        break;
+      }
+      await userMenu(result.user, result.isNew);
     }
-    await exportUser(result.user, result.isNew);
   }
 
   closeDb();
-  p.outro("导出完成 → db/dida.db");
+  p.outro("再见");
   process.exit(0);
 }
 
 main().catch((err) => {
-  p.log.error(`导出失败: ${err}`);
+  p.log.error(`运行失败: ${err}`);
   closeDb();
   process.exit(1);
 });

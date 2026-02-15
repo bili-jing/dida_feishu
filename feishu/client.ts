@@ -1,22 +1,50 @@
 import * as lark from "@larksuiteoapi/node-sdk";
 
-const FEISHU_APP_ID = Bun.env.FEISHU_APP_ID!;
-const FEISHU_APP_SECRET = Bun.env.FEISHU_APP_SECRET!;
+// 缓存：按 appId 复用 client 实例
+const _clientCache = new Map<string, lark.Client>();
 
-let _client: lark.Client | null = null;
+// 当前活跃的 client（通过 setFeishuCredentials 或 env 设置）
+let _activeAppId: string | null = null;
+
+/** 设置当前用户的飞书凭据，后续调用 getFeishuClient() 会使用此凭据 */
+export function setFeishuCredentials(appId: string, appSecret: string) {
+  _activeAppId = appId;
+  if (!_clientCache.has(appId)) {
+    _clientCache.set(appId, new lark.Client({
+      appId,
+      appSecret,
+      domain: lark.Domain.Feishu,
+    }));
+  }
+}
+
+/** 清除当前活跃凭据，回退到 env 配置 */
+export function clearFeishuCredentials() {
+  _activeAppId = null;
+}
 
 export function getFeishuClient(): lark.Client {
-  if (!_client) {
-    if (!FEISHU_APP_ID || !FEISHU_APP_SECRET) {
-      throw new Error("请在 .env 中配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET");
-    }
-    _client = new lark.Client({
-      appId: FEISHU_APP_ID,
-      appSecret: FEISHU_APP_SECRET,
-      domain: lark.Domain.Feishu,
-    });
+  // 优先使用 setFeishuCredentials 设置的凭据
+  if (_activeAppId) {
+    const client = _clientCache.get(_activeAppId);
+    if (client) return client;
   }
-  return _client;
+
+  // 回退到环境变量
+  const envAppId = Bun.env.FEISHU_APP_ID;
+  const envAppSecret = Bun.env.FEISHU_APP_SECRET;
+  if (!envAppId || !envAppSecret) {
+    throw new Error("未配置飞书凭据，请先绑定飞书应用或在 .env 中配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET");
+  }
+
+  if (!_clientCache.has(envAppId)) {
+    _clientCache.set(envAppId, new lark.Client({
+      appId: envAppId,
+      appSecret: envAppSecret,
+      domain: lark.Domain.Feishu,
+    }));
+  }
+  return _clientCache.get(envAppId)!;
 }
 
 /** 延迟，避免限流 */

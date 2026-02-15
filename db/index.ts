@@ -86,6 +86,21 @@ function initSchema(db: Database) {
     )
   `);
 
+  db.run(`
+    CREATE TABLE IF NOT EXISTS attachment_cache (
+      attachment_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      file_name TEXT,
+      file_type TEXT,
+      file_size INTEGER,
+      local_path TEXT,
+      feishu_file_token TEXT,
+      downloaded_at TEXT,
+      uploaded_at TEXT
+    )
+  `);
+
   // 迁移：给旧 tokens 表加 expires_at 列，并回填默认值
   try { db.run(`ALTER TABLE tokens ADD COLUMN expires_at INTEGER`); } catch {}
   db.run(`UPDATE tokens SET expires_at = created_at + 2592000 WHERE expires_at IS NULL`);
@@ -305,6 +320,62 @@ export function getStats(userId: string) {
   const total = rows.reduce((s, r) => s + r.c, 0);
 
   return { projects: projectCount, active: m.get(0) ?? 0, completed: m.get(2) ?? 0, abandoned: m.get(-1) ?? 0, total };
+}
+
+// ─── 附件缓存 ────────────────────────────────────────
+
+export interface AttachmentCacheRow {
+  attachment_id: string;
+  user_id: string;
+  task_id: string;
+  file_name: string;
+  file_type: string;
+  file_size: number;
+  local_path: string | null;
+  feishu_file_token: string | null;
+  downloaded_at: string | null;
+  uploaded_at: string | null;
+}
+
+/** 获取已缓存的附件信息 */
+export function getAttachmentCache(attachmentId: string): AttachmentCacheRow | null {
+  return getDb().query(
+    `SELECT * FROM attachment_cache WHERE attachment_id = ?`
+  ).get(attachmentId) as AttachmentCacheRow | null;
+}
+
+/** 保存附件下载信息 */
+export function saveAttachmentDownload(
+  attachmentId: string, userId: string, taskId: string,
+  fileName: string, fileType: string, fileSize: number, localPath: string
+) {
+  getDb().run(`
+    INSERT INTO attachment_cache (attachment_id, user_id, task_id, file_name, file_type, file_size, local_path, downloaded_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    ON CONFLICT (attachment_id) DO UPDATE SET
+      local_path = excluded.local_path, downloaded_at = datetime('now')
+  `, [attachmentId, userId, taskId, fileName, fileType, fileSize, localPath]);
+}
+
+/** 保存附件上传后的 file_token */
+export function saveAttachmentUpload(attachmentId: string, fileToken: string) {
+  getDb().run(`
+    UPDATE attachment_cache SET feishu_file_token = ?, uploaded_at = datetime('now')
+    WHERE attachment_id = ?
+  `, [fileToken, attachmentId]);
+}
+
+/** 获取任务的所有已上传附件 token */
+export function getTaskFileTokens(taskId: string): Array<{ file_token: string; file_name: string }> {
+  return getDb().query(
+    `SELECT feishu_file_token as file_token, file_name FROM attachment_cache
+     WHERE task_id = ? AND feishu_file_token IS NOT NULL`
+  ).all(taskId) as any[];
+}
+
+/** 清除用户的附件缓存 */
+export function clearAttachmentCache(userId: string) {
+  getDb().run(`DELETE FROM attachment_cache WHERE user_id = ?`, [userId]);
 }
 
 // ─── 生命周期 ─────────────────────────────────────────

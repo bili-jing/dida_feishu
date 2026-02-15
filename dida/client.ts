@@ -399,4 +399,17 @@ export class DidaClient {
   async getTaskSummary(): Promise<TaskSummary> {
     return this.request<TaskSummary>("/tasks/summary");
   }
+
+  /** 下载附件文件 */
+  async downloadAttachment(path: string): Promise<Buffer> {
+    if (!this.token) throw new Error("未登录，请先调用 login()");
+    const url = `https://api.dida365.com${path}`;
+    const res = await fetch(url, {
+      headers: { ...BROWSER_HEADERS, Cookie: `t=${this.token}` },
+    });
+    if (!res.ok) {
+      throw new Error(`下载附件失败 ${path}: ${res.status}`);
+    }
+    return Buffer.from(await res.arrayBuffer());
+  }
 }

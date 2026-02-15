@@ -1,27 +1,35 @@
 /**
- * 增量同步脚本：从 SQLite 读取滴答任务 → 写入飞书多维表格
+ * 全量同步脚本：从 SQLite 读取滴答任务 → 下载附件 → 上传飞书 → 创建多维表格
  *
- * - 首次同步：创建多维表格 + 写入全部任务
- * - 后续同步：只处理新增和变更的任务，已同步的不重复写入
+ * - 下载滴答附件（图片/PDF/DOC等）并缓存到本地
+ * - 上传到飞书 Drive，获取 file_token
+ * - 创建多维表格，写入全部任务（含附件、子任务、清洗后的内容）
  *
  * 用法:
  *   bun run sync.ts                     # 同步所有用户
- *   bun run sync.ts --user test         # 同步指定用户
- *   bun run sync.ts --reset             # 清除飞书配置，强制全量重建
+ *   bun run sync.ts --user <id>         # 同步指定用户
+ *   bun run sync.ts --reset             # 清除所有缓存，全量重建
  */
 
 import { Database } from "bun:sqlite";
+import { mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import {
   createBitable,
   createTable,
   createView,
+  getFieldMap,
+  patchView,
   batchCreateRecords,
-  batchUpdateRecords,
-  getBitableInfo,
+  uploadMedia,
+  getFeishuClient,
   type BitableField,
 } from "./feishu/client.ts";
 
 const DB_FILE = "./db/dida.db";
+const DOWNLOADS_DIR = "./downloads";
+
+// ─── 类型 ────────────────────────────────────────────
 
 interface TaskRow {
   id: string;
@@ -39,55 +47,115 @@ interface TaskRow {
   modified_time: string | null;
   tags: string | null;
   items: string | null;
+  raw: string | null;
   project_name: string | null;
+}
+
+interface AttachmentInfo {
+  id: string;
+  path: string;
+  fileName: string;
+  fileType: string;
+  size: number;
 }
 
 // ─── 字段定义 ─────────────────────────────────────────
 
 const TASK_FIELDS: BitableField[] = [
-  { field_name: "任务名称", type: 1 },
-  { field_name: "状态", type: 3, property: {
-    options: [
-      { name: "进行中", color: 0 },
-      { name: "已完成", color: 1 },
-      { name: "已放弃", color: 2 },
-    ],
-  }},
-  { field_name: "优先级", type: 3, property: {
-    options: [
-      { name: "无", color: 3 },
-      { name: "低", color: 0 },
-      { name: "中", color: 4 },
-      { name: "高", color: 2 },
-    ],
-  }},
-  { field_name: "所属清单", type: 1 },
+  { field_name: "内容标题", type: 1 },
+  {
+    field_name: "类型",
+    type: 3,
+    property: {
+      options: [
+        { name: "纯文本", color: 0 },
+        { name: "聊天记录", color: 4 },
+        { name: "图片", color: 1 },
+        { name: "文件", color: 3 },
+        { name: "图文混合", color: 5 },
+        { name: "清单", color: 6 },
+        { name: "链接", color: 2 },
+      ],
+    },
+  },
+  { field_name: "链接", type: 15 },
   { field_name: "内容", type: 1 },
-  { field_name: "标签", type: 4, property: { options: [] }},
-  { field_name: "创建时间", type: 5, property: { date_formatter: "yyyy/MM/dd HH:mm" }},
-  { field_name: "截止时间", type: 5, property: { date_formatter: "yyyy/MM/dd HH:mm" }},
-  { field_name: "完成时间", type: 5, property: { date_formatter: "yyyy/MM/dd HH:mm" }},
+  { field_name: "附件", type: 17 },
+  { field_name: "标签", type: 4, property: { options: [] } },
+  { field_name: "子任务", type: 1 },
+  {
+    field_name: "状态",
+    type: 3,
+    property: {
+      options: [
+        { name: "进行中", color: 0 },
+        { name: "已完成", color: 1 },
+        { name: "已放弃", color: 2 },
+      ],
+    },
+  },
+  { field_name: "所属清单", type: 3, property: { options: [] } },
+  {
+    field_name: "优先级",
+    type: 3,
+    property: {
+      options: [
+        { name: "无", color: 3 },
+        { name: "低", color: 0 },
+        { name: "中", color: 4 },
+        { name: "高", color: 2 },
+      ],
+    },
+  },
+  {
+    field_name: "创建时间",
+    type: 5,
+    property: { date_formatter: "yyyy/MM/dd HH:mm" },
+  },
+  {
+    field_name: "截止时间",
+    type: 5,
+    property: { date_formatter: "yyyy/MM/dd HH:mm" },
+  },
+  {
+    field_name: "完成时间",
+    type: 5,
+    property: { date_formatter: "yyyy/MM/dd HH:mm" },
+  },
   { field_name: "滴答ID", type: 1 },
 ];
 
 // ─── 辅助函数 ─────────────────────────────────────────
 
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 function statusText(status: number): string {
   switch (status) {
-    case 0: return "进行中";
-    case 2: return "已完成";
-    case -1: return "已放弃";
-    default: return "进行中";
+    case 0:
+      return "进行中";
+    case 2:
+      return "已完成";
+    case -1:
+      return "已放弃";
+    default:
+      return "进行中";
   }
 }
 
 function priorityText(priority: number): string {
   switch (priority) {
-    case 0: return "无";
-    case 1: return "低";
-    case 3: return "中";
-    case 5: return "高";
-    default: return "无";
+    case 0:
+      return "无";
+    case 1:
+      return "低";
+    case 3:
+      return "中";
+    case 5:
+      return "高";
+    default:
+      return "无";
   }
 }
 
@@ -99,63 +167,199 @@ function parseDate(dateStr: string | null): number | null {
 
 function parseTags(tagsJson: string | null): string[] {
   if (!tagsJson || tagsJson === "null") return [];
-  try { return JSON.parse(tagsJson); } catch { return []; }
+  try {
+    return JSON.parse(tagsJson);
+  } catch {
+    return [];
+  }
 }
 
-function taskToFields(task: TaskRow): Record<string, any> {
+/** 清洗内容：将附件标记替换为可读文字，将 markdown 链接转为纯文本 */
+function cleanContent(content: string | null): string {
+  if (!content) return "";
+  return content
+    // ![image](id/filename.jpg) → [图片: filename.jpg]
+    .replace(/!\[image\]\(([^)]+)\)/g, (_m, path: string) => {
+      const name = path.includes("/") ? path.split("/").pop()! : path;
+      return `[图片: ${decodeURIComponent(name)}]`;
+    })
+    // ![file](id/filename.pdf) → [文件: filename.pdf]
+    .replace(/!\[file\]\(([^)]+)\)/g, (_m, path: string) => {
+      const name = path.includes("/") ? path.split("/").pop()! : path;
+      return `[文件: ${decodeURIComponent(name)}]`;
+    })
+    // [链接文字](url) → 链接文字
+    .replace(/\[([^\]]+)\]\(https?:\/\/[^)]+\)/g, "$1")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/** 格式化子任务为可读文本 */
+function formatItems(itemsJson: string | null): string {
+  if (!itemsJson || itemsJson === "null") return "";
+  try {
+    const items = JSON.parse(itemsJson) as Array<{
+      title: string;
+      status: number;
+    }>;
+    if (!items.length) return "";
+    return items
+      .map((item) => `${item.status === 2 ? "☑" : "☐"} ${item.title}`)
+      .join("\n");
+  } catch {
+    return "";
+  }
+}
+
+/** 判断标题是否包含链接 */
+function titleHasLink(title: string): boolean {
+  // markdown link: [text](url) 或标题里直接有 http
+  return /\]\(https?:\/\//.test(title) || /https?:\/\//.test(title);
+}
+
+/** 提取标题中的纯文字部分（去掉 markdown 链接语法） */
+function cleanTitle(title: string): string {
+  // [text](url) → text
+  return title
+    .replace(/\[([^\]]*)\]\([^)]+\)/g, "$1")
+    .replace(/https?:\/\/[^\s]*/g, "")
+    .trim();
+}
+
+/** 从文本中提取第一个链接 URL 和对应的文字 */
+function extractLink(text: string): { url: string; text: string } | null {
+  // 优先提取 [text](url) 格式
+  const mdMatch = text.match(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/);
+  if (mdMatch) return { text: mdMatch[1], url: mdMatch[2] };
+  // 其次提取裸链接
+  const urlMatch = text.match(/(https?:\/\/[^\s]+)/);
+  if (urlMatch) return { text: urlMatch[1], url: urlMatch[1] };
+  return null;
+}
+
+/** 根据内容特征自动判断任务类型 */
+function classifyType(task: TaskRow): string {
+  const c = task.content || "";
+  const hasImage = c.includes("![image]");
+  const hasFile = c.includes("![file]");
+  const hasLink = /https?:\/\//.test(c) || titleHasLink(task.title);
+  const hasItems =
+    task.items != null && task.items !== "null" && task.items !== "[]";
+  // 聊天记录特征：含时间戳行或微信转发标记
+  const isChat =
+    /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\n/.test(c) ||
+    c.includes("[该消息类型暂不能展示]");
+  // 去掉附件标记和链接后的纯文字
+  const cleanText = c
+    .replace(/!\[(image|file)\]\([^)]+\)/g, "")
+    .replace(/https?:\/\/[^\s]*/g, "")
+    .trim();
+
+  if (hasItems) return "清单";
+  if (isChat) return "聊天记录";
+  if (hasImage && hasFile) return "图文混合";
+  if ((hasImage || hasFile) && cleanText) return "图文混合";
+  if (hasImage && !cleanText) return "图片";
+  if (hasFile && !cleanText) return "文件";
+  if (hasLink && cleanText) return "图文混合";
+  if (hasLink && !cleanText) return "链接";
+  return "纯文本";
+}
+
+/** 从 raw JSON 解析附件信息 */
+function parseAttachments(raw: string | null): AttachmentInfo[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed.attachments?.length) return [];
+    return parsed.attachments.map((a: any) => ({
+      id: a.id,
+      path: a.path,
+      fileName: a.fileName,
+      fileType: a.fileType,
+      size: a.size ?? 0,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/** 构建记录字段 */
+function taskToFields(
+  task: TaskRow,
+  fileTokens?: Array<{ file_token: string }>
+): Record<string, any> {
+  // 标题含链接时提取纯文字作为标题
+  const hasTitleLink = titleHasLink(task.title);
+  const displayTitle = hasTitleLink ? cleanTitle(task.title) || task.title : task.title;
+
+  const contentText = cleanContent(task.content) || task.desc || "";
+
   const fields: Record<string, any> = {
-    "任务名称": task.title,
-    "状态": statusText(task.status),
-    "优先级": priorityText(task.priority),
-    "所属清单": task.project_name || task.project_id || "",
-    "内容": task.content || task.desc || "",
-    "滴答ID": task.id,
+    内容标题: displayTitle,
+    类型: classifyType(task),
+    状态: statusText(task.status),
+    优先级: priorityText(task.priority),
+    所属清单: task.project_name || "",
+    内容: contentText,
+    滴答ID: task.id,
   };
+
+  // 链接字段：优先从标题提取，其次从内容提取
+  const titleLink = hasTitleLink ? extractLink(task.title) : null;
+  const contentLink = !titleLink && task.content ? extractLink(task.content) : null;
+  const link = titleLink || contentLink;
+  if (link) {
+    fields["链接"] = { link: link.url, text: link.text };
+  }
+
+  if (fileTokens && fileTokens.length > 0) {
+    fields["附件"] = fileTokens;
+  }
+
+  const subTasks = formatItems(task.items);
+  if (subTasks) fields["子任务"] = subTasks;
+
   const tags = parseTags(task.tags);
   if (tags.length > 0) fields["标签"] = tags;
+
   const createdTime = parseDate(task.created_time);
   if (createdTime) fields["创建时间"] = createdTime;
   const dueDate = parseDate(task.due_date);
   if (dueDate) fields["截止时间"] = dueDate;
   const completedTime = parseDate(task.completed_time);
   if (completedTime) fields["完成时间"] = completedTime;
+
   return fields;
 }
 
-// ─── DB 辅助（直接操作，不依赖 db/index.ts 避免单例冲突） ─
+// ─── DB 辅助 ─────────────────────────────────────────
 
-function getFeishuConfig(db: Database, userId: string) {
-  return db.query(
-    `SELECT app_token, table_id, app_url FROM feishu_config WHERE user_id = ?`
-  ).get(userId) as { app_token: string; table_id: string; app_url: string | null } | null;
-}
-
-function saveFeishuConfig(db: Database, userId: string, appToken: string, tableId: string, appUrl?: string) {
-  db.run(`
-    INSERT INTO feishu_config (user_id, app_token, table_id, app_url)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT (user_id) DO UPDATE SET
-      app_token = excluded.app_token, table_id = excluded.table_id,
-      app_url = excluded.app_url, updated_at = datetime('now')
-  `, [userId, appToken, tableId, appUrl ?? null]);
-}
-
-interface SyncRecord {
-  dida_task_id: string;
-  feishu_record_id: string | null;
-  last_modified_time: string | null;
-}
-
-function getSyncMap(db: Database, userId: string): Map<string, SyncRecord> {
-  const rows = db.query(
-    `SELECT dida_task_id, feishu_record_id, last_modified_time FROM sync_state WHERE user_id = ? AND sync_status = 'synced'`
-  ).all(userId) as SyncRecord[];
-  return new Map(rows.map(r => [r.dida_task_id, r]));
+function saveFeishuConfig(
+  db: Database,
+  userId: string,
+  appToken: string,
+  tableId: string,
+  appUrl?: string
+) {
+  db.run(
+    `INSERT INTO feishu_config (user_id, app_token, table_id, app_url)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT (user_id) DO UPDATE SET
+       app_token = excluded.app_token, table_id = excluded.table_id,
+       app_url = excluded.app_url, updated_at = datetime('now')`,
+    [userId, appToken, tableId, appUrl ?? null]
+  );
 }
 
 function batchUpsertSyncState(
-  db: Database, userId: string,
-  items: Array<{ taskId: string; recordId: string; modifiedTime: string | null }>
+  db: Database,
+  userId: string,
+  items: Array<{
+    taskId: string;
+    recordId: string;
+    modifiedTime: string | null;
+  }>
 ) {
   const stmt = db.prepare(`
     INSERT INTO sync_state (dida_task_id, user_id, feishu_record_id, last_synced_at, last_modified_time, sync_status)
@@ -173,12 +377,247 @@ function batchUpsertSyncState(
   })();
 }
 
-// ─── 首次同步 ────────────────────────────────────────
+// ─── 附件缓存 DB ─────────────────────────────────────
 
-async function initialSync(db: Database, userId: string, tasks: TaskRow[]) {
-  // 1. 创建多维表格
+function getCachedFileToken(db: Database, attachmentId: string): string | null {
+  const row = db
+    .query(
+      `SELECT feishu_file_token FROM attachment_cache WHERE attachment_id = ? AND feishu_file_token IS NOT NULL`
+    )
+    .get(attachmentId) as { feishu_file_token: string } | null;
+  return row?.feishu_file_token ?? null;
+}
+
+function getCachedLocalPath(db: Database, attachmentId: string): string | null {
+  const row = db
+    .query(
+      `SELECT local_path FROM attachment_cache WHERE attachment_id = ? AND local_path IS NOT NULL`
+    )
+    .get(attachmentId) as { local_path: string } | null;
+  return row?.local_path ?? null;
+}
+
+function saveDownloadCache(
+  db: Database,
+  attachmentId: string,
+  userId: string,
+  taskId: string,
+  fileName: string,
+  fileType: string,
+  fileSize: number,
+  localPath: string
+) {
+  db.run(
+    `INSERT INTO attachment_cache (attachment_id, user_id, task_id, file_name, file_type, file_size, local_path, downloaded_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+     ON CONFLICT (attachment_id) DO UPDATE SET
+       local_path = excluded.local_path, downloaded_at = datetime('now')`,
+    [attachmentId, userId, taskId, fileName, fileType, fileSize, localPath]
+  );
+}
+
+function saveUploadCache(
+  db: Database,
+  attachmentId: string,
+  fileToken: string
+) {
+  db.run(
+    `UPDATE attachment_cache SET feishu_file_token = ?, uploaded_at = datetime('now')
+     WHERE attachment_id = ?`,
+    [fileToken, attachmentId]
+  );
+}
+
+function getTaskFileTokens(
+  db: Database,
+  taskId: string
+): Array<{ file_token: string }> {
+  return db
+    .query(
+      `SELECT feishu_file_token as file_token FROM attachment_cache
+       WHERE task_id = ? AND feishu_file_token IS NOT NULL`
+    )
+    .all(taskId) as any[];
+}
+
+// ─── 附件处理流程 ─────────────────────────────────────
+
+async function processAttachments(
+  db: Database,
+  userId: string,
+  tasks: TaskRow[],
+  appToken: string,
+  didaToken: string
+) {
+  // 收集所有需要处理的附件
+  const allAttachments: Array<{
+    taskId: string;
+    projectId: string;
+    att: AttachmentInfo;
+  }> = [];
+  for (const task of tasks) {
+    const atts = parseAttachments(task.raw);
+    for (const att of atts) {
+      allAttachments.push({
+        taskId: task.id,
+        projectId: task.project_id,
+        att,
+      });
+    }
+  }
+
+  if (!allAttachments.length) {
+    console.log("  没有附件需要处理");
+    return;
+  }
+
+  console.log(`  共 ${allAttachments.length} 个附件需要处理`);
+  await mkdir(DOWNLOADS_DIR, { recursive: true });
+
+  const headers: Record<string, string> = {
+    "User-Agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    Accept: "*/*",
+    Cookie: `t=${didaToken}`,
+  };
+
+  let downloaded = 0;
+  let uploaded = 0;
+  let skippedCached = 0;
+  let failed = 0;
+
+  for (let i = 0; i < allAttachments.length; i++) {
+    const { taskId, projectId, att } = allAttachments[i];
+
+    // 进度报告
+    if ((i + 1) % 100 === 0 || i === 0) {
+      console.log(
+        `  附件 ${i + 1}/${allAttachments.length} ` +
+          `(下载=${downloaded} 上传=${uploaded} 缓存=${skippedCached} 失败=${failed})`
+      );
+    }
+
+    // 已有 file_token → 跳过
+    const cachedToken = getCachedFileToken(db, att.id);
+    if (cachedToken) {
+      skippedCached++;
+      continue;
+    }
+
+    try {
+      // 1. 下载（或读取本地缓存）
+      let localPath = getCachedLocalPath(db, att.id);
+      let fileBuffer: Buffer;
+
+      if (localPath && existsSync(localPath)) {
+        fileBuffer = Buffer.from(await Bun.file(localPath).arrayBuffer());
+      } else {
+        // URL 格式: /api/v1/attachment/{projectId}/{taskId}/{attachmentId}{extension}
+        const ext = att.fileName.substring(att.fileName.lastIndexOf("."));
+        const url = `https://api.dida365.com/api/v1/attachment/${projectId}/${taskId}/${att.id}${ext}`;
+        const res = await fetch(url, {
+          headers,
+          tls: { rejectUnauthorized: false },
+        });
+        if (!res.ok) {
+          console.warn(`  ⚠ 下载失败 ${att.fileName}: ${res.status}`);
+          failed++;
+          continue;
+        }
+        fileBuffer = Buffer.from(await res.arrayBuffer());
+
+        // 保存到本地
+        const dir = `${DOWNLOADS_DIR}/${att.id}`;
+        await mkdir(dir, { recursive: true });
+        localPath = `${dir}/${att.fileName}`;
+        await Bun.write(localPath, fileBuffer);
+
+        saveDownloadCache(
+          db,
+          att.id,
+          userId,
+          taskId,
+          att.fileName,
+          att.fileType,
+          att.size,
+          localPath
+        );
+        downloaded++;
+        await sleep(100);
+      }
+
+      // 2. 上传到飞书
+      const isImage = att.fileType === "IMAGE";
+      const fileToken = await uploadMedia(
+        appToken,
+        att.fileName,
+        fileBuffer,
+        isImage
+      );
+      saveUploadCache(db, att.id, fileToken);
+      uploaded++;
+
+      await sleep(200); // 5 QPS 限制
+    } catch (e) {
+      console.warn(
+        `  ⚠ 处理附件失败 ${att.fileName}:`,
+        (e as Error).message
+      );
+      failed++;
+    }
+  }
+
+  console.log(
+    `  附件处理完成: 下载=${downloaded} 上传=${uploaded} 缓存=${skippedCached} 失败=${failed}`
+  );
+}
+
+// ─── 同步用户 ────────────────────────────────────────
+
+async function syncUser(db: Database, userId: string, skipAttachments = false) {
+  console.log(`\n--- 同步用户: ${userId} ---`);
+
+  // 获取显示名称
+  const tokenRow = db
+    .query(`SELECT extra, token FROM tokens WHERE user_id = ?`)
+    .get(userId) as { extra: string; token: string } | null;
+  const displayName = tokenRow?.extra
+    ? JSON.parse(tokenRow.extra).displayName
+    : userId;
+  const didaToken = tokenRow?.token;
+
+  // 加载任务
+  const tasks = db
+    .query(
+      `SELECT t.id, t.user_id, t.project_id, t.title, t.content, t."desc",
+              t.status, t.priority, t.start_date, t.due_date,
+              t.completed_time, t.created_time, t.modified_time,
+              t.tags, t.items, t.raw, p.name as project_name
+       FROM tasks t
+       LEFT JOIN projects p ON t.project_id = p.id AND t.user_id = p.user_id
+       WHERE t.user_id = ?
+       ORDER BY t.created_time DESC`
+    )
+    .all(userId) as TaskRow[];
+
+  if (!tasks.length) {
+    console.log("  没有任务需要同步");
+    return;
+  }
+  console.log(`  本地任务: ${tasks.length} 条`);
+
+  // 清除旧的同步状态（重建表格）
+  db.run(`DELETE FROM feishu_config WHERE user_id = ?`, [userId]);
+  db.run(`DELETE FROM sync_state WHERE user_id = ?`, [userId]);
+  // 清除旧的 file_token（新表格需要重新上传），但保留 local_path
+  db.run(
+    `UPDATE attachment_cache SET feishu_file_token = NULL, uploaded_at = NULL WHERE user_id = ?`,
+    [userId]
+  );
+
+  // 1. 创建飞书多维表格
   console.log("  创建飞书多维表格...");
-  const app = await createBitable(`滴答清单 - ${userId}`);
+  const app = await createBitable(`滴答清单 - ${displayName}`);
   console.log(`  链接: ${app.url}`);
   const appToken = app.app_token!;
 
@@ -186,35 +625,91 @@ async function initialSync(db: Database, userId: string, tasks: TaskRow[]) {
   console.log("  创建任务数据表...");
   const { tableId } = await createTable(appToken, "任务列表", TASK_FIELDS);
 
-  // 3. 创建视图
+  // 3. 获取字段 ID 映射并创建视图
   try {
-    await createView(appToken, tableId, "进行中", "grid");
-    await createView(appToken, tableId, "已完成", "grid");
+    const fieldMap = await getFieldMap(appToken, tableId);
+    const statusField = fieldMap["状态"];
+
+    // 辅助：根据 option name 获取 option id
+    const optionId = (field: typeof statusField, name: string) =>
+      field?.options?.find(o => o.name === name)?.id;
+
+    // 进行中视图：筛选 状态=进行中
+    const optInProgress = optionId(statusField, "进行中");
+    if (statusField && optInProgress) {
+      const v = await createView(appToken, tableId, "进行中", "grid");
+      if (v.view_id) {
+        await patchView(appToken, tableId, v.view_id, {
+          filter_info: {
+            conjunction: "and",
+            conditions: [{ field_id: statusField.field_id, operator: "is", value: JSON.stringify([optInProgress]) }],
+          },
+        });
+      }
+    }
+
+    // 已完成视图：筛选 状态=已完成
+    const optCompleted = optionId(statusField, "已完成");
+    if (statusField && optCompleted) {
+      const v = await createView(appToken, tableId, "已完成", "grid");
+      if (v.view_id) {
+        await patchView(appToken, tableId, v.view_id, {
+          filter_info: {
+            conjunction: "and",
+            conditions: [{ field_id: statusField.field_id, operator: "is", value: JSON.stringify([optCompleted]) }],
+          },
+        });
+      }
+    }
+
+    // 看板视图（按状态）
     await createView(appToken, tableId, "看板", "kanban");
-    console.log("  视图: 全部任务、进行中、已完成、看板");
-  } catch {}
+
+    console.log("  视图已创建并配置");
+  } catch (e) {
+    console.warn("  ⚠ 视图配置部分失败:", (e as Error).message);
+  }
 
   // 4. 删除默认空表
   try {
-    const { getFeishuClient } = await import("./feishu/client.ts");
     const client = getFeishuClient();
-    const tablesRes = await client.bitable.appTable.list({ path: { app_token: appToken } });
+    const tablesRes = await client.bitable.appTable.list({
+      path: { app_token: appToken },
+    });
     for (const t of tablesRes.data?.items ?? []) {
       if (t.table_id !== tableId && t.name === "Table1") {
-        await client.bitable.appTable.delete({ path: { app_token: appToken, table_id: t.table_id! } });
+        await client.bitable.appTable.delete({
+          path: { app_token: appToken, table_id: t.table_id! },
+        });
       }
     }
   } catch {}
 
-  // 5. 写入全部记录
+  // 5. 处理附件（下载 + 上传）
+  if (skipAttachments) {
+    console.log("  跳过附件处理 (--no-attachments)");
+  } else if (didaToken) {
+    await processAttachments(db, userId, tasks, appToken, didaToken);
+  } else {
+    console.log("  ⚠ 无法获取滴答 token，跳过附件处理");
+  }
+
+  // 6. 构建记录并写入
   console.log(`  写入 ${tasks.length} 条记录...`);
-  const records = tasks.map(t => ({ fields: taskToFields(t) }));
+  const records = tasks.map((task) => {
+    const fileTokens = getTaskFileTokens(db, task.id);
+    return {
+      fields: taskToFields(
+        task,
+        fileTokens.length > 0 ? fileTokens : undefined
+      ),
+    };
+  });
   const created = await batchCreateRecords(appToken, tableId, records);
   console.log(`  成功写入 ${created.length} 条`);
 
-  // 6. 保存配置和同步状态
+  // 7. 保存配置和同步状态
   saveFeishuConfig(db, userId, appToken, tableId, app.url);
-
   const syncItems = tasks.map((t, i) => ({
     taskId: t.id,
     recordId: created[i]?.record_id ?? "",
@@ -222,133 +717,15 @@ async function initialSync(db: Database, userId: string, tasks: TaskRow[]) {
   }));
   batchUpsertSyncState(db, userId, syncItems);
 
-  console.log(`  飞书配置已保存，后续同步将增量更新`);
+  console.log(`\n  ✓ 同步完成！`);
+  console.log(`  飞书链接: ${app.url}`);
   return { appToken, tableId, appUrl: app.url };
-}
-
-// ─── 增量同步 ────────────────────────────────────────
-
-async function incrementalSync(
-  db: Database, userId: string, tasks: TaskRow[],
-  config: { app_token: string; table_id: string; app_url: string | null }
-) {
-  const { app_token: appToken, table_id: tableId } = config;
-
-  // 验证飞书表格是否还存在
-  try {
-    await getBitableInfo(appToken);
-  } catch {
-    console.log("  飞书多维表格已不存在，重新创建...");
-    db.run(`DELETE FROM sync_state WHERE user_id = ?`, [userId]);
-    db.run(`DELETE FROM feishu_config WHERE user_id = ?`, [userId]);
-    return initialSync(db, userId, tasks);
-  }
-
-  console.log(`  飞书表格: ${config.app_url}`);
-
-  // 获取已同步的映射
-  const syncMap = getSyncMap(db, userId);
-  console.log(`  已同步: ${syncMap.size} 条`);
-
-  // 分类：新增 / 变更 / 不变
-  const toCreate: TaskRow[] = [];
-  const toUpdate: { task: TaskRow; recordId: string }[] = [];
-  let unchanged = 0;
-
-  for (const task of tasks) {
-    const synced = syncMap.get(task.id);
-    if (!synced) {
-      toCreate.push(task);
-    } else if (!synced.feishu_record_id) {
-      // 有同步记录但没有 record_id，当作新增
-      toCreate.push(task);
-    } else if (task.modified_time && task.modified_time !== synced.last_modified_time) {
-      toUpdate.push({ task, recordId: synced.feishu_record_id });
-    } else {
-      unchanged++;
-    }
-  }
-
-  console.log(`  新增: ${toCreate.length} | 变更: ${toUpdate.length} | 不变: ${unchanged}`);
-
-  // 处理新增
-  if (toCreate.length > 0) {
-    console.log(`  写入 ${toCreate.length} 条新记录...`);
-    const records = toCreate.map(t => ({ fields: taskToFields(t) }));
-    const created = await batchCreateRecords(appToken, tableId, records);
-
-    const syncItems = toCreate.map((t, i) => ({
-      taskId: t.id,
-      recordId: created[i]?.record_id ?? "",
-      modifiedTime: t.modified_time,
-    }));
-    batchUpsertSyncState(db, userId, syncItems);
-    console.log(`  新增完成: ${created.length} 条`);
-  }
-
-  // 处理变更
-  if (toUpdate.length > 0) {
-    console.log(`  更新 ${toUpdate.length} 条变更记录...`);
-    const records = toUpdate.map(({ task, recordId }) => ({
-      record_id: recordId,
-      fields: taskToFields(task),
-    }));
-    const updated = await batchUpdateRecords(appToken, tableId, records);
-
-    const syncItems = toUpdate.map(({ task, recordId }) => ({
-      taskId: task.id,
-      recordId,
-      modifiedTime: task.modified_time,
-    }));
-    batchUpsertSyncState(db, userId, syncItems);
-    console.log(`  更新完成: ${updated.length} 条`);
-  }
-
-  if (toCreate.length === 0 && toUpdate.length === 0) {
-    console.log("  所有任务已是最新，无需同步");
-  }
-
-  return config;
 }
 
 // ─── 主逻辑 ──────────────────────────────────────────
 
-async function syncUser(db: Database, userId: string) {
-  console.log(`\n--- 同步用户: ${userId} ---`);
-
-  const tasks = db.query(`
-    SELECT t.id, t.user_id, t.project_id, t.title, t.content, t."desc",
-           t.status, t.priority, t.start_date, t.due_date,
-           t.completed_time, t.created_time, t.modified_time,
-           t.tags, t.items, p.name as project_name
-    FROM tasks t
-    LEFT JOIN projects p ON t.project_id = p.id AND t.user_id = p.user_id
-    WHERE t.user_id = ?
-    ORDER BY t.created_time DESC
-  `).all(userId) as TaskRow[];
-
-  if (!tasks.length) {
-    console.log("  没有任务需要同步");
-    return;
-  }
-
-  console.log(`  本地任务: ${tasks.length} 条`);
-
-  const config = getFeishuConfig(db, userId);
-
-  let result;
-  if (config) {
-    result = await incrementalSync(db, userId, tasks, config);
-  } else {
-    result = await initialSync(db, userId, tasks);
-  }
-
-  console.log(`\n  ✓ 同步完成！`);
-  if (result?.appUrl) console.log(`  飞书链接: ${result.appUrl}`);
-}
-
 async function main() {
-  console.log("=== 滴答 → 飞书 同步 ===");
+  console.log("=== 滴答 → 飞书 全量同步（含附件） ===");
 
   const db = new Database(DB_FILE);
   db.run("PRAGMA journal_mode = WAL");
@@ -368,16 +745,27 @@ async function main() {
       PRIMARY KEY (dida_task_id, user_id)
     )
   `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS attachment_cache (
+      attachment_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL, task_id TEXT NOT NULL,
+      file_name TEXT, file_type TEXT, file_size INTEGER,
+      local_path TEXT, feishu_file_token TEXT,
+      downloaded_at TEXT, uploaded_at TEXT
+    )
+  `);
 
   const args = process.argv.slice(2);
 
-  // --reset: 清除飞书配置
+  // --reset: 完全清除（含本地下载缓存）
   if (args.includes("--reset")) {
     db.run(`DELETE FROM feishu_config`);
     db.run(`DELETE FROM sync_state`);
-    console.log("已清除所有飞书同步配置，将重新创建");
+    db.run(`DELETE FROM attachment_cache`);
+    console.log("已清除所有同步配置和附件缓存");
   }
 
+  const skipAttachments = args.includes("--no-attachments");
   const idx = args.indexOf("--user");
   const filterUser = idx !== -1 ? args[idx + 1] : null;
 
@@ -386,7 +774,9 @@ async function main() {
     users = [filterUser];
   } else {
     users = (
-      db.query("SELECT DISTINCT user_id FROM tasks").all() as { user_id: string }[]
+      db
+        .query("SELECT DISTINCT user_id FROM tasks")
+        .all() as { user_id: string }[]
     ).map((r) => r.user_id);
   }
 
@@ -398,7 +788,7 @@ async function main() {
 
   for (const userId of users) {
     try {
-      await syncUser(db, userId);
+      await syncUser(db, userId, skipAttachments);
     } catch (e) {
       console.error(`  同步用户 ${userId} 失败:`, e);
     }

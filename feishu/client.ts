@@ -32,7 +32,7 @@ export interface BitableField {
   property?: any;
 }
 
-/** 创建多维表格 */
+/** 创建多维表格（自动设置链接可编辑权限） */
 export async function createBitable(name: string, folderToken?: string) {
   const client = getFeishuClient();
   const res = await client.bitable.app.create({
@@ -43,7 +43,21 @@ export async function createBitable(name: string, folderToken?: string) {
     },
   });
   if (res.code !== 0) throw new Error(`创建多维表格失败: ${res.msg}`);
-  return res.data!.app!;
+  const app = res.data!.app!;
+
+  // 设置链接分享权限：组织内有链接的人可编辑
+  try {
+    await client.drive.permissionPublic.patch({
+      path: { token: app.app_token! },
+      params: { type: "bitable" },
+      data: {
+        link_share_entity: "tenant_editable",
+        comment_entity: "anyone_can_edit",
+      },
+    });
+  } catch {}
+
+  return app;
 }
 
 /** 创建数据表（含字段定义） */
@@ -88,6 +102,48 @@ export async function createView(
   });
   if (res.code !== 0) throw new Error(`创建视图失败: ${res.msg}`);
   return res.data!.view!;
+}
+
+export interface FieldInfo {
+  field_id: string;
+  options?: Array<{ name: string; id: string }>;
+}
+
+/** 获取数据表的字段列表，返回 { field_name → FieldInfo } 映射 */
+export async function getFieldMap(
+  appToken: string,
+  tableId: string
+): Promise<Record<string, FieldInfo>> {
+  const client = getFeishuClient();
+  const res = await client.bitable.appTableField.list({
+    path: { app_token: appToken, table_id: tableId },
+  });
+  const map: Record<string, FieldInfo> = {};
+  for (const f of res.data?.items ?? []) {
+    if (f.field_name && f.field_id) {
+      map[f.field_name] = {
+        field_id: f.field_id,
+        options: f.property?.options?.map((o: any) => ({ name: o.name, id: o.id })),
+      };
+    }
+  }
+  return map;
+}
+
+/** 更新视图属性（筛选、分组等） */
+export async function patchView(
+  appToken: string,
+  tableId: string,
+  viewId: string,
+  property: Record<string, any>
+) {
+  const client = getFeishuClient();
+  const res = await client.bitable.appTableView.patch({
+    path: { app_token: appToken, table_id: tableId, view_id: viewId },
+    data: { property },
+  });
+  if (res.code !== 0) throw new Error(`更新视图失败: ${res.msg}`);
+  return res.data;
 }
 
 /** 批量创建记录（每批最多 500 条） */
@@ -147,6 +203,30 @@ export async function getBitableInfo(appToken: string) {
   });
   if (res.code !== 0) throw new Error(`获取多维表格信息失败: ${res.msg}`);
   return res.data!.app!;
+}
+
+/** 上传文件到飞书，返回 file_token */
+export async function uploadMedia(
+  appToken: string,
+  fileName: string,
+  fileBuffer: Buffer,
+  isImage: boolean = false,
+): Promise<string> {
+  const client = getFeishuClient();
+  const res = await client.drive.media.uploadAll({
+    data: {
+      file_name: fileName,
+      parent_type: isImage ? "bitable_image" : "bitable_file",
+      parent_node: appToken,
+      size: fileBuffer.length,
+      file: fileBuffer,
+    },
+  });
+  const fileToken = res?.file_token ?? (res as any)?.data?.file_token;
+  if (!fileToken) {
+    throw new Error(`上传文件失败: ${fileName}, response: ${JSON.stringify(res)}`);
+  }
+  return fileToken;
 }
 
 // ─── 文档操作 ─────────────────────────────────────────

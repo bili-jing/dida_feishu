@@ -115,6 +115,30 @@ export async function batchCreateRecords(
   return results;
 }
 
+/** 批量更新记录（每批最多 500 条） */
+export async function batchUpdateRecords(
+  appToken: string,
+  tableId: string,
+  records: Array<{ record_id: string; fields: Record<string, any> }>
+) {
+  const client = getFeishuClient();
+  const results: any[] = [];
+
+  for (let i = 0; i < records.length; i += 500) {
+    const batch = records.slice(i, i + 500);
+    const res = await client.bitable.appTableRecord.batchUpdate({
+      data: { records: batch },
+      path: { app_token: appToken, table_id: tableId },
+    });
+    if (res.code !== 0) throw new Error(`批量更新记录失败: ${res.msg}`);
+    results.push(...(res.data!.records ?? []));
+
+    if (i + 500 < records.length) await sleep(300);
+  }
+
+  return results;
+}
+
 /** 获取多维表格信息 */
 export async function getBitableInfo(appToken: string) {
   const client = getFeishuClient();

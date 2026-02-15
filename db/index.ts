@@ -75,6 +75,17 @@ function initSchema(db: Database) {
     )
   `);
 
+  db.run(`
+    CREATE TABLE IF NOT EXISTS feishu_config (
+      user_id TEXT PRIMARY KEY,
+      app_token TEXT NOT NULL,
+      table_id TEXT NOT NULL,
+      app_url TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+
   // 迁移：给旧 tokens 表加 expires_at 列，并回填默认值
   try { db.run(`ALTER TABLE tokens ADD COLUMN expires_at INTEGER`); } catch {}
   db.run(`UPDATE tokens SET expires_at = created_at + 2592000 WHERE expires_at IS NULL`);
@@ -202,13 +213,80 @@ export function getValidUsers(): { user_id: string; extra: any; expires_at: numb
   }));
 }
 
-/** 删除用户的所有数据（token + 项目 + 任务 + 同步状态） */
+/** 删除用户的所有数据（token + 项目 + 任务 + 同步状态 + 飞书配置） */
 export function deleteUser(userId: string) {
   const db = getDb();
   db.run(`DELETE FROM tokens WHERE user_id = ?`, [userId]);
   db.run(`DELETE FROM projects WHERE user_id = ?`, [userId]);
   db.run(`DELETE FROM tasks WHERE user_id = ?`, [userId]);
   db.run(`DELETE FROM sync_state WHERE user_id = ?`, [userId]);
+  db.run(`DELETE FROM feishu_config WHERE user_id = ?`, [userId]);
+}
+
+// ─── 飞书配置 ────────────────────────────────────────
+
+export interface FeishuConfig {
+  user_id: string;
+  app_token: string;
+  table_id: string;
+  app_url: string | null;
+}
+
+export function getFeishuConfig(userId: string): FeishuConfig | null {
+  const row = getDb().query(
+    `SELECT user_id, app_token, table_id, app_url FROM feishu_config WHERE user_id = ?`
+  ).get(userId) as any;
+  return row ?? null;
+}
+
+export function saveFeishuConfig(userId: string, appToken: string, tableId: string, appUrl?: string) {
+  getDb().run(`
+    INSERT INTO feishu_config (user_id, app_token, table_id, app_url)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT (user_id) DO UPDATE SET
+      app_token = excluded.app_token, table_id = excluded.table_id,
+      app_url = excluded.app_url, updated_at = datetime('now')
+  `, [userId, appToken, tableId, appUrl ?? null]);
+}
+
+// ─── 同步状态查询 ────────────────────────────────────
+
+export interface SyncRecord {
+  dida_task_id: string;
+  feishu_record_id: string | null;
+  last_modified_time: string | null;
+  sync_status: string;
+}
+
+/** 获取用户所有已同步记录的映射 { dida_task_id → SyncRecord } */
+export function getSyncMap(userId: string): Map<string, SyncRecord> {
+  const rows = getDb().query(
+    `SELECT dida_task_id, feishu_record_id, last_modified_time, sync_status
+     FROM sync_state WHERE user_id = ?`
+  ).all(userId) as SyncRecord[];
+  return new Map(rows.map(r => [r.dida_task_id, r]));
+}
+
+/** 批量更新同步状态 */
+export function batchUpsertSyncState(
+  userId: string,
+  items: Array<{ taskId: string; recordId: string; modifiedTime: string | null }>
+) {
+  const stmt = getDb().prepare(`
+    INSERT INTO sync_state (dida_task_id, user_id, feishu_record_id, last_synced_at, last_modified_time, sync_status)
+    VALUES (?, ?, ?, datetime('now'), ?, 'synced')
+    ON CONFLICT (dida_task_id, user_id) DO UPDATE SET
+      feishu_record_id = excluded.feishu_record_id,
+      last_synced_at = datetime('now'),
+      last_modified_time = excluded.last_modified_time,
+      sync_status = 'synced'
+  `);
+  const batch = getDb().transaction(() => {
+    for (const item of items) {
+      stmt.run(item.taskId, userId, item.recordId, item.modifiedTime);
+    }
+  });
+  batch();
 }
 
 // ─── 统计 ─────────────────────────────────────────────

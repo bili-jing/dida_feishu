@@ -1,7 +1,6 @@
 import { Database } from "bun:sqlite";
 import type { Project, Task } from "../types.ts";
-
-const DB_FILE = "./db/dida.db";
+import { DB_FILE } from "../utils/paths.ts";
 
 let _db: Database | null = null;
 

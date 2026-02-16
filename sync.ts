@@ -31,9 +31,7 @@ import {
   clearFeishuCredentials,
   type BitableField,
 } from "./feishu/client.ts";
-
-const DB_FILE = "./db/dida.db";
-const DOWNLOADS_DIR = "./downloads";
+import { DB_FILE, DOWNLOADS_DIR } from "./utils/paths.ts";
 
 // ─── 类型 ────────────────────────────────────────────
 

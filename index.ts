@@ -13,6 +13,7 @@ import type { UserConfig } from "./types.ts";
 import { displayQr } from "./utils/qr.ts";
 import { fullSyncUser, incrementalSyncUser } from "./sync.ts";
 import { setFeishuCredentials, clearFeishuCredentials } from "./feishu/client.ts";
+import { DB_FILE } from "./utils/paths.ts";
 
 // ─── 参数解析 ──────────────────────────────────────────
 
@@ -595,7 +596,6 @@ async function syncToFeishu(userId: string) {
 
   const feishuConfig = getFeishuConfig(userId);
   const comparison = feishuConfig ? getSyncComparison(userId) : null;
-  const DB_FILE = "./db/dida.db";
 
   if (feishuConfig && comparison) {
     // 已有飞书配置 → 显示同步状态
@@ -867,11 +867,24 @@ async function main() {
 
   closeDb();
   p.outro("再见");
+  await waitBeforeExit();
   process.exit(0);
 }
 
-main().catch((err) => {
+/** Windows 双击运行时等待用户按回车再退出，防止闪退 */
+async function waitBeforeExit() {
+  if (process.platform === "win32" && process.stdin.isTTY) {
+    console.log("\n按回车键退出...");
+    process.stdin.resume();
+    await new Promise<void>((resolve) => {
+      process.stdin.once("data", () => resolve());
+    });
+  }
+}
+
+main().catch(async (err) => {
   p.log.error(`运行失败: ${err}`);
   closeDb();
+  await waitBeforeExit();
   process.exit(1);
 });

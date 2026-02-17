@@ -250,6 +250,7 @@ export class DidaClient {
 
     const res = await fetch(url, {
       headers: { ...BROWSER_HEADERS, Cookie: `t=${this.token}` },
+      signal: AbortSignal.timeout(30_000),
     });
 
     if (!res.ok) {

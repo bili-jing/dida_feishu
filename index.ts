@@ -165,21 +165,21 @@ async function addNewUser(): Promise<UserConfig | null> {
   };
 }
 
-// ─── 微信扫码回调 ──────────────────────────────────────
+// ─── 微信扫码回调（不使用 spinner，避免 Bun clearInterval 问题）───
 
-function createWechatCallbacks(s: ReturnType<typeof p.spinner>): LoginCallbacks {
+function createWechatCallbacks(): LoginCallbacks {
   return {
     async onQrUrl(imageUrl, qrData) {
-      s.stop("获取二维码成功");
+      p.log.step("获取二维码成功");
       try {
         await displayQr(qrData);
       } catch {
         p.log.warn(`终端渲染失败，请打开链接扫码: ${imageUrl}`);
       }
     },
-    onScanWaiting() { s.start("等待微信扫码..."); },
-    onScanScanned() { s.message("已扫码，等待确认..."); },
-    onScanConfirmed() { s.stop("微信授权成功"); },
+    onScanWaiting() { p.log.info("请使用微信扫描上方二维码..."); },
+    onScanScanned() { p.log.step("已扫码，等待确认..."); },
+    onScanConfirmed() { p.log.step("微信授权成功"); },
   };
 }
 
@@ -187,24 +187,21 @@ function createWechatCallbacks(s: ReturnType<typeof p.spinner>): LoginCallbacks 
 
 async function fetchData(user: UserConfig, forceLogin = false) {
   const client = new DidaClient(user);
-  const s = p.spinner();
 
-  // 1. 登录
-  s.start("登录中...");
+  // 1. 登录（不用 spinner，Bun 下 clearInterval 对短生命周期 interval 清理不干净）
   try {
-    const callbacks = user.authType === "wechat" ? createWechatCallbacks(s) : undefined;
+    const callbacks = user.authType === "wechat" ? createWechatCallbacks() : undefined;
     await client.login(forceLogin, callbacks);
-    if (!callbacks) s.stop("登录成功");
+    if (!callbacks) p.log.step("登录成功");
   } catch (e) {
-    s.stop("登录失败");
+    p.log.error("登录失败");
     throw e;
   }
 
-  // 2. 获取用户信息 + 去重处理
-  s.start("获取用户信息...");
+  // 2. 获取用户信息（不用 spinner，可能需要用户交互）
   try {
     const profile = await client.getUserProfile();
-    s.stop(`用户: ${profile.displayName || profile.name} (${profile.username})`);
+    p.log.step(`用户: ${profile.displayName || profile.name} (${profile.username})`);
 
     if (forceLogin && profile.userCode) {
       const existingUsers = getValidUsers();
@@ -266,51 +263,47 @@ async function fetchData(user: UserConfig, forceLogin = false) {
       }
     }
   } catch (e) {
-    s.stop("获取用户信息失败");
-    p.log.error(String(e));
+    p.log.error(`获取用户信息失败: ${e}`);
   }
 
   // 3. 拉取前的统计（用于对比）
   const beforeStats = getStats(user.id);
 
-  // 4. 项目和活跃任务
+  // 4-7. 数据拉取（单个 spinner，用 message() 更新进度，只有一次 start/stop）
+  const s = p.spinner();
   s.start("获取项目和活跃任务...");
+
   const batch = await client.getBatchData();
   const projects = batch.projectProfiles;
   const activeTasks = batch.syncTaskBean?.update ?? [];
   upsertProjects(user.id, projects);
   upsertTasks(user.id, activeTasks);
-  s.stop(`项目: ${projects.length}，活跃任务: ${activeTasks.length}`);
 
-  // 5. 已完成任务
-  s.start("获取已完成任务...");
+  s.message(`获取已完成任务... (项目: ${projects.length}, 活跃: ${activeTasks.length})`);
   try {
     const completed = await client.getCompletedTasks();
     upsertTasks(user.id, completed);
-    s.stop(`已完成: ${completed.length}`);
   } catch (e) {
-    s.stop(`获取已完成任务失败: ${e}`);
+    p.log.warn(`获取已完成任务失败: ${e}`);
   }
 
-  // 6. 已放弃任务
-  s.start("获取已放弃任务...");
+  s.message("获取已放弃任务...");
   try {
     const abandoned = await client.getAbandonedTasks();
     upsertTasks(user.id, abandoned);
-    s.stop(`已放弃: ${abandoned.length}`);
   } catch (e) {
-    s.stop(`获取已放弃任务失败: ${e}`);
+    p.log.warn(`获取已放弃任务失败: ${e}`);
   }
 
-  // 7. 垃圾桶任务
-  s.start("获取垃圾桶任务...");
+  s.message("获取垃圾桶任务...");
   try {
     const trash = await client.getTrashTasks();
     upsertTasks(user.id, trash);
-    s.stop(`垃圾桶: ${trash.length}`);
   } catch (e) {
-    s.stop(`获取垃圾桶任务失败: ${e}`);
+    p.log.warn(`获取垃圾桶任务失败: ${e}`);
   }
+
+  s.stop("数据拉取完成");
 
   // 8. 统计对比
   const afterStats = getStats(user.id);

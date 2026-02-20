@@ -99,6 +99,7 @@ function initSchema(db: Database) {
     )
   `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_doc_history_user ON feishu_doc_history (user_id, is_current)`);
+  db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_history_user_token ON feishu_doc_history (user_id, app_token)`);
 
   db.run(`
     CREATE TABLE IF NOT EXISTS attachment_cache (
@@ -274,7 +275,7 @@ export function getValidUsers(): { user_id: string; extra: any; expires_at: numb
   }));
 }
 
-/** 删除用户的所有数据（token + 项目 + 任务 + 同步状态 + 飞书配置 + 飞书凭据） */
+/** 删除用户的所有数据（token + 项目 + 任务 + 同步状态 + 飞书配置 + 文档历史 + 飞书凭据） */
 export function deleteUser(userId: string) {
   const db = getDb();
   db.run(`DELETE FROM tokens WHERE user_id = ?`, [userId]);
@@ -282,6 +283,7 @@ export function deleteUser(userId: string) {
   db.run(`DELETE FROM tasks WHERE user_id = ?`, [userId]);
   db.run(`DELETE FROM sync_state WHERE user_id = ?`, [userId]);
   db.run(`DELETE FROM feishu_config WHERE user_id = ?`, [userId]);
+  db.run(`DELETE FROM feishu_doc_history WHERE user_id = ?`, [userId]);
   db.run(`DELETE FROM feishu_credentials WHERE user_id = ?`, [userId]);
   db.run(`DELETE FROM ai_credentials WHERE user_id = ?`, [userId]);
   db.run(`DELETE FROM ai_cache WHERE user_id = ?`, [userId]);
@@ -350,7 +352,12 @@ export function addDocHistory(
   }
   getDb().run(
     `INSERT INTO feishu_doc_history (user_id, app_token, table_id, app_url, name, is_current)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT (user_id, app_token) DO UPDATE SET
+       table_id = COALESCE(excluded.table_id, table_id),
+       app_url = COALESCE(excluded.app_url, app_url),
+       name = COALESCE(excluded.name, name),
+       is_current = excluded.is_current`,
     [userId, appToken, tableId, appUrl, name, isCurrent ? 1 : 0]
   );
 }

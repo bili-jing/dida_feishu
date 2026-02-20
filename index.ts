@@ -771,6 +771,12 @@ async function docManagementMenu(userId: string) {
     }
   }
 
+  // 显示一次性提示
+  if (merged.some(d => d.source === "local")) {
+    const localOnly = merged.filter(d => d.source === "local");
+    p.log.warn(`${localOnly.length} 个本地记录的文档在云空间中未找到（可能已手动删除）`);
+  }
+
   while (true) {
     const options: Array<{ value: string; label: string; hint?: string }> = merged
       .filter(d => d.source !== "local")
@@ -779,11 +785,6 @@ async function docManagementMenu(userId: string) {
         label: `${d.isCurrent ? "★ " : "  "}${d.name}`,
         hint: `${d.isCurrent ? "当前使用" : ""}${d.created_time ? ` ${formatTime(d.created_time)}` : ""}`,
       }));
-
-    if (merged.some(d => d.source === "local")) {
-      const localOnly = merged.filter(d => d.source === "local");
-      p.log.warn(`${localOnly.length} 个本地记录的文档在云空间中未找到（可能已手动删除）`);
-    }
 
     options.push({ value: "__batch_delete__", label: "批量删除非当前文档" });
     options.push({ value: "__back__", label: "← 返回" });
@@ -815,6 +816,7 @@ async function docManagementMenu(userId: string) {
           markDocDeleted(doc.token);
           deleted++;
           ds.message(`删除中 (${deleted}/${nonCurrent.length})...`);
+          if (deleted < nonCurrent.length) await new Promise(r => setTimeout(r, 300));
         } catch (e) {
           p.log.warn(`删除 ${doc.name} 失败: ${(e as Error).message}`);
         }

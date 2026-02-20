@@ -863,6 +863,38 @@ async function docManagementMenu(userId: string) {
   }
 }
 
+/** 全量重建前提示用户处理旧文档 */
+async function promptDeleteOldDoc(userId: string): Promise<boolean> {
+  const config = getFeishuConfig(userId);
+  if (!config) return true; // 没有旧文档，直接继续
+
+  const choice = await p.select({
+    message: `检测到旧表格，如何处理？`,
+    options: [
+      { value: "delete", label: "删除旧表格后重建", hint: "旧表格移入飞书回收站" },
+      { value: "keep", label: "保留旧表格，创建新的" },
+      { value: "cancel", label: "取消" },
+    ],
+  });
+  exitIfCancelled(choice);
+
+  if (choice === "cancel") return false;
+
+  if (choice === "delete") {
+    try {
+      const s = p.spinner();
+      s.start("删除旧表格...");
+      await deleteBitable(config.app_token);
+      markDocDeleted(config.app_token);
+      s.stop("旧表格已删除（可在飞书回收站恢复）");
+    } catch (e) {
+      p.log.warn(`删除旧表格失败: ${(e as Error).message}，将保留旧表格继续重建`);
+    }
+  }
+
+  return true;
+}
+
 // ─── 同步到飞书 ───────────────────────────────────────
 
 async function syncToFeishu(userId: string) {
@@ -912,6 +944,8 @@ async function syncToFeishu(userId: string) {
           await aiOnlySyncUser(db, userId);
           s.stop("AI 增量更新完成");
         } else {
+          const shouldProceed = await promptDeleteOldDoc(userId);
+          if (!shouldProceed) { db.close(); return; }
           s.start("全量同步中...");
           await fullSyncUser(db, userId, false);
           s.stop("全量同步完成");
@@ -963,6 +997,8 @@ async function syncToFeishu(userId: string) {
           s.stop("增量同步完成");
         }
       } else {
+        const shouldProceed = await promptDeleteOldDoc(userId);
+        if (!shouldProceed) { db.close(); return; }
         s.start("全量同步中...");
         await fullSyncUser(db, userId, false);
         s.stop("全量同步完成");

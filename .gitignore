@@ -41,3 +41,4 @@ db/*.db-wal
 .playwright-mcp
 dida-export
 downloads/
+.ace-tool/

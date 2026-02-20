@@ -545,13 +545,19 @@ async function feishuConfigMenu(userId: string) {
     // 已绑定 → 显示状态，提供换绑/解绑
     let info = `App ID: ${creds.app_id.slice(0, 6)}...${creds.app_id.slice(-4)}`;
     if (feishuConfig?.app_url) {
-      info += `\n飞书链接: ${feishuConfig.app_url}`;
+      info += `\n当前文档: ${feishuConfig.app_url}`;
+    }
+    const docHistory = getDocHistory(userId);
+    const historyCount = docHistory.filter(d => d.is_current === 0).length;
+    if (historyCount > 0) {
+      info += `\n历史文档: ${historyCount} 个`;
     }
     p.note(info, "当前飞书配置");
 
     const choice = await p.select({
       message: "飞书配置操作",
       options: [
+        { value: "docs", label: "管理文档", hint: "查看/删除飞书文档" },
         { value: "rebind", label: "换绑", hint: "更换飞书应用凭据" },
         { value: "unbind", label: "解绑", hint: "移除飞书凭据" },
         { value: "__back__", label: "← 返回" },
@@ -559,7 +565,9 @@ async function feishuConfigMenu(userId: string) {
     });
     exitIfCancelled(choice);
 
-    if (choice === "rebind") {
+    if (choice === "docs") {
+      await docManagementMenu(userId);
+    } else if (choice === "rebind") {
       await bindFeishu(userId);
     } else if (choice === "unbind") {
       const confirmed = await p.confirm({ message: "确认解绑飞书？解绑后需重新配置才能同步" });

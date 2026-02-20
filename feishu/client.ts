@@ -73,19 +73,34 @@ export async function createBitable(name: string, folderToken?: string) {
   if (res.code !== 0) throw new Error(`创建多维表格失败: ${res.msg}`);
   const app = res.data!.app!;
 
-  // 设置链接分享权限：组织内有链接的人可编辑
+  // 设置链接分享权限：互联网上获得链接的任何人可编辑（支持外部用户访问）
   try {
     await client.drive.permissionPublic.patch({
       path: { token: app.app_token! },
       params: { type: "bitable" },
       data: {
-        link_share_entity: "tenant_editable",
+        external_access: true,
+        link_share_entity: "anyone_editable",
         comment_entity: "anyone_can_edit",
       },
     });
   } catch {}
 
   return app;
+}
+
+/** 更新已有多维表格的分享权限（支持外部用户访问） */
+export async function ensureBitablePermission(appToken: string) {
+  const client = getFeishuClient();
+  await client.drive.permissionPublic.patch({
+    path: { token: appToken },
+    params: { type: "bitable" },
+    data: {
+      external_access: true,
+      link_share_entity: "anyone_editable",
+      comment_entity: "anyone_can_edit",
+    },
+  });
 }
 
 /** 创建数据表（含字段定义） */
@@ -231,6 +246,65 @@ export async function getBitableInfo(appToken: string) {
   });
   if (res.code !== 0) throw new Error(`获取多维表格信息失败: ${res.msg}`);
   return res.data!.app!;
+}
+
+/** 删除飞书多维表格（移入回收站） */
+export async function deleteBitable(appToken: string) {
+  const client = getFeishuClient();
+  const res = await client.drive.file.delete({
+    params: { type: "bitable" },
+    path: { file_token: appToken },
+  });
+  if (res.code !== 0) throw new Error(`删除多维表格失败: ${res.msg}`);
+  return res.data;
+}
+
+/** 扫描飞书云空间，查找名称包含指定前缀的多维表格 */
+export async function scanBitables(namePrefix: string = "滴答清单"): Promise<Array<{
+  token: string;
+  name: string;
+  type: string;
+  created_time: string;
+  modified_time: string;
+  url: string;
+}>> {
+  const client = getFeishuClient();
+  const results: Array<{
+    token: string;
+    name: string;
+    type: string;
+    created_time: string;
+    modified_time: string;
+    url: string;
+  }> = [];
+
+  let pageToken: string | undefined;
+  do {
+    const res = await client.drive.file.list({
+      params: {
+        folder_token: "",
+        page_size: 50,
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
+    });
+    if (res.code !== 0) throw new Error(`扫描云空间失败: ${res.msg}`);
+
+    for (const file of res.data?.files ?? []) {
+      if (file.type === "bitable" && file.name?.includes(namePrefix)) {
+        results.push({
+          token: file.token!,
+          name: file.name!,
+          type: file.type!,
+          created_time: file.created_time ?? "",
+          modified_time: file.modified_time ?? "",
+          url: file.url ?? `https://feishu.cn/base/${file.token}`,
+        });
+      }
+    }
+    pageToken = res.data?.next_page_token;
+  } while (pageToken);
+
+  return results;
 }
 
 /** 上传文件到飞书，返回 file_token */

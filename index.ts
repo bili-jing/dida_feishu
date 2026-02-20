@@ -5,14 +5,16 @@ import {
   getCachedToken, saveToken, closeDb, getFeishuConfig, getSyncComparison,
   searchTasks, getTaskDetail, getUnsyncedTasks, getModifiedTasks,
   getFeishuCredentials, saveFeishuCredentials, deleteFeishuCredentials,
+  getAICredentials, saveAICredentials, deleteAICredentials, clearAICache,
+  getDocHistory, addDocHistory, markDocDeleted, getCurrentDoc, demoteCurrentDoc,
   type TaskSearchResult,
 } from "./db/index.ts";
 import { DidaClient } from "./dida/client.ts";
 import type { LoginCallbacks } from "./dida/client.ts";
 import type { UserConfig } from "./types.ts";
 import { displayQr } from "./utils/qr.ts";
-import { fullSyncUser, incrementalSyncUser } from "./sync.ts";
-import { setFeishuCredentials, clearFeishuCredentials } from "./feishu/client.ts";
+import { fullSyncUser, incrementalSyncUser, aiOnlySyncUser } from "./sync.ts";
+import { setFeishuCredentials, clearFeishuCredentials, scanBitables, deleteBitable } from "./feishu/client.ts";
 import { DB_FILE } from "./utils/paths.ts";
 
 // ─── 参数解析 ──────────────────────────────────────────
@@ -574,6 +576,285 @@ async function feishuConfigMenu(userId: string) {
   }
 }
 
+// ─── AI 配置 ──────────────────────────────────────────
+
+async function bindAI(userId: string): Promise<boolean> {
+  p.log.info("请在火山引擎控制台获取 API Key 和模型名称");
+  p.log.info("地址: https://console.volcengine.com/ark");
+
+  const apiKey = await p.text({
+    message: "API Key",
+    validate: (v) => (!v ? "请输入 API Key" : undefined),
+  });
+  exitIfCancelled(apiKey);
+
+  const model = await p.text({
+    message: "文本模型名称",
+    placeholder: "doubao-seed-2-0-lite-260215",
+    defaultValue: "doubao-seed-2-0-lite-260215",
+  });
+  exitIfCancelled(model);
+
+  const useVision = await p.confirm({
+    message: "是否配置视觉模型（用于图片理解）？",
+    initialValue: false,
+  });
+  exitIfCancelled(useVision);
+
+  let visionModel: string | undefined;
+  if (useVision) {
+    const vid = await p.text({
+      message: "视觉模型名称",
+      placeholder: "doubao-1-5-vision-pro-250328",
+    });
+    exitIfCancelled(vid);
+    visionModel = vid as string;
+  }
+
+  // 验证
+  const s = p.spinner();
+  s.start("验证 AI 配置...");
+  try {
+    const { validateConfig } = await import("./ai/client.ts");
+    const ok = await validateConfig({
+      apiKey: apiKey as string,
+      model: model as string,
+      visionModel,
+    });
+    if (!ok) throw new Error("API 验证失败");
+    s.stop("AI 配置验证成功");
+  } catch (e) {
+    s.stop("AI 配置验证失败");
+    p.log.error(`验证失败: ${(e as Error).message}`);
+    return false;
+  }
+
+  saveAICredentials(userId, apiKey as string, model as string, visionModel);
+  p.log.success("AI 配置已保存，同步时将自动生成摘要");
+  return true;
+}
+
+async function aiConfigMenu(userId: string) {
+  const creds = getAICredentials(userId);
+
+  if (creds) {
+    let info = `模型: ${creds.model}`;
+    if (creds.vision_model) info += `\n视觉模型: ${creds.vision_model}`;
+    p.note(info, "当前 AI 配置");
+
+    const choice = await p.select({
+      message: "AI 配置操作",
+      options: [
+        { value: "rebind", label: "重新配置", hint: "更换 API Key 和模型" },
+        { value: "unbind", label: "移除配置", hint: "关闭 AI 功能" },
+        { value: "clear_cache", label: "清除缓存", hint: "重新生成所有 AI 摘要" },
+        { value: "__back__", label: "← 返回" },
+      ],
+    });
+    exitIfCancelled(choice);
+
+    if (choice === "rebind") {
+      await bindAI(userId);
+    } else if (choice === "unbind") {
+      const confirmed = await p.confirm({ message: "确认移除 AI 配置？" });
+      exitIfCancelled(confirmed);
+      if (confirmed) {
+        deleteAICredentials(userId);
+        clearAICache(userId);
+        p.log.success("已移除 AI 配置");
+      }
+    } else if (choice === "clear_cache") {
+      clearAICache(userId);
+      p.log.success("AI 缓存已清除，下次同步将重新生成摘要");
+    }
+  } else {
+    await bindAI(userId);
+  }
+}
+
+// ─── 文档管理 ──────────────────────────────────────
+
+function formatTime(ts: string): string {
+  const num = Number(ts);
+  if (!isNaN(num) && num > 1e9) {
+    return new Date(num * 1000).toLocaleDateString("zh-CN");
+  }
+  try {
+    return new Date(ts).toLocaleDateString("zh-CN");
+  } catch {
+    return ts;
+  }
+}
+
+async function docManagementMenu(userId: string) {
+  // 需要飞书凭据才能扫描
+  if (!activateFeishuCredentials(userId)) {
+    p.log.warn("需要先绑定飞书应用才能管理文档");
+    return;
+  }
+
+  const s = p.spinner();
+  s.start("扫描飞书云空间...");
+
+  let cloudDocs: Array<{ token: string; name: string; created_time: string; url: string }> = [];
+  try {
+    cloudDocs = await scanBitables("滴答清单");
+  } catch (e) {
+    s.stop("扫描失败");
+    p.log.error(`扫描飞书云空间失败: ${(e as Error).message}`);
+    return;
+  }
+
+  // 合并本地历史
+  const localDocs = getDocHistory(userId);
+  const currentConfig = getFeishuConfig(userId);
+
+  // 用 app_token 去重，云空间为准，补充本地标记
+  const tokenSet = new Set<string>();
+  interface MergedDoc {
+    token: string;
+    name: string;
+    url: string;
+    created_time: string;
+    isCurrent: boolean;
+    source: "cloud" | "local" | "both";
+  }
+  const merged: MergedDoc[] = [];
+
+  for (const doc of cloudDocs) {
+    tokenSet.add(doc.token);
+    const local = localDocs.find(l => l.app_token === doc.token);
+    merged.push({
+      token: doc.token,
+      name: doc.name,
+      url: doc.url,
+      created_time: doc.created_time,
+      isCurrent: currentConfig?.app_token === doc.token,
+      source: local ? "both" : "cloud",
+    });
+  }
+
+  // 本地有但云空间没有的（可能已被手动删除）
+  for (const doc of localDocs) {
+    if (!tokenSet.has(doc.app_token)) {
+      if (doc.deleted_at) continue;
+      merged.push({
+        token: doc.app_token,
+        name: doc.name ?? "未知文档",
+        url: doc.app_url ?? "",
+        created_time: doc.created_at,
+        isCurrent: doc.is_current === 1,
+        source: "local",
+      });
+    }
+  }
+
+  s.stop(`发现 ${merged.length} 个文档`);
+
+  if (merged.length === 0) {
+    p.log.info("没有发现任何飞书文档");
+    return;
+  }
+
+  // 同步云空间发现的文档到本地历史
+  for (const doc of merged) {
+    if (doc.source === "cloud") {
+      addDocHistory(userId, doc.token, null, doc.url, doc.name, doc.isCurrent);
+    }
+  }
+
+  while (true) {
+    const options: Array<{ value: string; label: string; hint?: string }> = merged
+      .filter(d => d.source !== "local")
+      .map(d => ({
+        value: d.token,
+        label: `${d.isCurrent ? "★ " : "  "}${d.name}`,
+        hint: `${d.isCurrent ? "当前使用" : ""}${d.created_time ? ` ${formatTime(d.created_time)}` : ""}`,
+      }));
+
+    if (merged.some(d => d.source === "local")) {
+      const localOnly = merged.filter(d => d.source === "local");
+      p.log.warn(`${localOnly.length} 个本地记录的文档在云空间中未找到（可能已手动删除）`);
+    }
+
+    options.push({ value: "__batch_delete__", label: "批量删除非当前文档" });
+    options.push({ value: "__back__", label: "← 返回" });
+
+    const choice = await p.select({ message: "选择文档操作", options });
+    exitIfCancelled(choice);
+
+    if (choice === "__back__") return;
+
+    if (choice === "__batch_delete__") {
+      const nonCurrent = merged.filter(d => !d.isCurrent && d.source !== "local");
+      if (nonCurrent.length === 0) {
+        p.log.info("没有可删除的历史文档");
+        continue;
+      }
+
+      const confirmed = await p.confirm({
+        message: `确认删除 ${nonCurrent.length} 个非当前文档？（将移入飞书回收站）`,
+      });
+      exitIfCancelled(confirmed);
+      if (!confirmed) continue;
+
+      const ds = p.spinner();
+      ds.start(`删除中 (0/${nonCurrent.length})...`);
+      let deleted = 0;
+      for (const doc of nonCurrent) {
+        try {
+          await deleteBitable(doc.token);
+          markDocDeleted(doc.token);
+          deleted++;
+          ds.message(`删除中 (${deleted}/${nonCurrent.length})...`);
+        } catch (e) {
+          p.log.warn(`删除 ${doc.name} 失败: ${(e as Error).message}`);
+        }
+      }
+      ds.stop(`已删除 ${deleted} 个文档`);
+
+      // 刷新列表
+      merged.splice(0, merged.length, ...merged.filter(d => d.isCurrent || !nonCurrent.includes(d)));
+      continue;
+    }
+
+    // 选择了单个文档
+    const doc = merged.find(d => d.token === choice);
+    if (!doc) continue;
+
+    const action = await p.select({
+      message: doc.name,
+      options: [
+        ...(doc.url ? [{ value: "open", label: "查看链接", hint: doc.url }] : []),
+        ...(!doc.isCurrent ? [{ value: "delete", label: "删除", hint: "移入飞书回收站" }] : []),
+        { value: "__back__", label: "← 返回" },
+      ],
+    });
+    exitIfCancelled(action);
+
+    if (action === "open" && doc.url) {
+      p.log.info(`飞书链接: ${doc.url}`);
+    } else if (action === "delete") {
+      const confirmed = await p.confirm({ message: `确认删除「${doc.name}」？` });
+      exitIfCancelled(confirmed);
+      if (confirmed) {
+        try {
+          const ds = p.spinner();
+          ds.start("删除中...");
+          await deleteBitable(doc.token);
+          markDocDeleted(doc.token);
+          ds.stop("已删除");
+
+          const idx = merged.indexOf(doc);
+          if (idx !== -1) merged.splice(idx, 1);
+        } catch (e) {
+          p.log.error(`删除失败: ${(e as Error).message}`);
+        }
+      }
+    }
+  }
+}
+
 // ─── 同步到飞书 ───────────────────────────────────────
 
 async function syncToFeishu(userId: string) {
@@ -595,20 +876,38 @@ async function syncToFeishu(userId: string) {
     let info = `飞书链接: ${feishuConfig.app_url ?? "未知"}`;
     info += `\n已同步: ${comparison.synced}  新增: ${comparison.newTasks}  修改: ${comparison.modified}`;
 
+    const hasAI = !!getAICredentials(userId);
+
     if (comparison.newTasks === 0 && comparison.modified === 0) {
       p.note(info + "\n\n所有数据已是最新", "同步状态");
-      const force = await p.confirm({ message: "是否强制全量重建？", initialValue: false });
-      exitIfCancelled(force);
-      if (!force) return;
 
-      // 全量重建
+      // 数据没变化，但仍可选 AI 更新或全量重建
+      const options: Array<{ value: string; label: string; hint?: string }> = [];
+      if (hasAI) {
+        options.push({ value: "ai_only", label: "AI 增量更新", hint: "只更新 AI标题/摘要/链接内容，不动附件" });
+      }
+      options.push(
+        { value: "full", label: "全量重建", hint: "创建新表格，重新上传所有数据" },
+        { value: "__back__", label: "← 返回" },
+      );
+
+      const choice = await p.select({ message: "选择操作", options });
+      exitIfCancelled(choice);
+      if (choice === "__back__") return;
+
       const db = new Database(DB_FILE);
       db.run("PRAGMA journal_mode = WAL");
       try {
         const s = p.spinner();
-        s.start("全量同步中...");
-        await fullSyncUser(db, userId, false);
-        s.stop("全量同步完成");
+        if (choice === "ai_only") {
+          s.start("AI 增量更新中...");
+          await aiOnlySyncUser(db, userId);
+          s.stop("AI 增量更新完成");
+        } else {
+          s.start("全量同步中...");
+          await fullSyncUser(db, userId, false);
+          s.stop("全量同步完成");
+        }
       } finally {
         db.close();
       }
@@ -617,25 +916,32 @@ async function syncToFeishu(userId: string) {
 
     p.note(info, "同步状态");
 
-    const syncChoice = await p.select({
-      message: "选择同步方式",
-      options: [
-        { value: "incremental", label: "增量同步", hint: `更新 ${comparison.newTasks + comparison.modified} 条` },
-        { value: "full", label: "全量重建", hint: "创建新表格，重新上传所有数据" },
-        { value: "__back__", label: "← 返回" },
-      ],
-    });
+    const syncOptions: Array<{ value: string; label: string; hint?: string }> = [
+      { value: "incremental", label: "增量同步", hint: `更新 ${comparison.newTasks + comparison.modified} 条` },
+    ];
+    if (hasAI) {
+      syncOptions.push({ value: "ai_only", label: "AI 增量更新", hint: "只更新 AI标题/摘要/链接内容，不动附件" });
+    }
+    syncOptions.push(
+      { value: "full", label: "全量重建", hint: "创建新表格，重新上传所有数据" },
+      { value: "__back__", label: "← 返回" },
+    );
+
+    const syncChoice = await p.select({ message: "选择同步方式", options: syncOptions });
     exitIfCancelled(syncChoice);
     if (syncChoice === "__back__") return;
-
-    const skipAtt = await p.confirm({ message: "是否跳过附件？", initialValue: false });
-    exitIfCancelled(skipAtt);
 
     const db = new Database(DB_FILE);
     db.run("PRAGMA journal_mode = WAL");
     try {
       const s = p.spinner();
-      if (syncChoice === "incremental") {
+      if (syncChoice === "ai_only") {
+        s.start("AI 增量更新中...");
+        await aiOnlySyncUser(db, userId);
+        s.stop("AI 增量更新完成");
+      } else if (syncChoice === "incremental") {
+        const skipAtt = await p.confirm({ message: "是否跳过附件？", initialValue: false });
+        exitIfCancelled(skipAtt);
         s.start(`增量同步中 (新增: ${comparison.newTasks}, 修改: ${comparison.modified})...`);
         const result = await incrementalSyncUser(
           db, userId, feishuConfig.app_token, feishuConfig.table_id, feishuConfig.app_url, skipAtt as boolean
@@ -650,7 +956,7 @@ async function syncToFeishu(userId: string) {
         }
       } else {
         s.start("全量同步中...");
-        await fullSyncUser(db, userId, skipAtt as boolean);
+        await fullSyncUser(db, userId, false);
         s.stop("全量同步完成");
       }
     } finally {
@@ -771,6 +1077,19 @@ async function userMenu(user: UserConfig, isNew: boolean) {
       hint: creds ? `已绑定 (${creds.app_id.slice(0, 6)}...)` : "未绑定",
     });
 
+    const aiCreds = getAICredentials(user.id);
+    options.push({
+      value: "ai_config",
+      label: "AI配置",
+      hint: aiCreds ? `已配置 (${aiCreds.model})` : "未配置",
+    });
+
+    options.push({
+      value: "doc_management",
+      label: "文档管理",
+      hint: "查看/删除飞书文档",
+    });
+
     options.push({
       value: "__back__",
       label: "← 返回主菜单",
@@ -800,6 +1119,12 @@ async function userMenu(user: UserConfig, isNew: boolean) {
         break;
       case "feishu_config":
         await feishuConfigMenu(user.id);
+        break;
+      case "ai_config":
+        await aiConfigMenu(user.id);
+        break;
+      case "doc_management":
+        await docManagementMenu(user.id);
         break;
       case "__back__":
         return;

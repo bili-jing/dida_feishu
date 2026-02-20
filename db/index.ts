@@ -86,6 +86,21 @@ function initSchema(db: Database) {
   `);
 
   db.run(`
+    CREATE TABLE IF NOT EXISTS feishu_doc_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      app_token TEXT NOT NULL,
+      table_id TEXT,
+      app_url TEXT,
+      name TEXT,
+      is_current INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      deleted_at TEXT
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_doc_history_user ON feishu_doc_history (user_id, is_current)`);
+
+  db.run(`
     CREATE TABLE IF NOT EXISTS attachment_cache (
       attachment_id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -107,6 +122,28 @@ function initSchema(db: Database) {
       app_secret TEXT NOT NULL,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS ai_credentials (
+      user_id TEXT PRIMARY KEY,
+      api_key TEXT NOT NULL,
+      model TEXT NOT NULL,
+      vision_model TEXT,
+      updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS ai_cache (
+      task_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      ai_title TEXT,
+      ai_summary TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      PRIMARY KEY (task_id, user_id)
     )
   `);
 
@@ -246,6 +283,8 @@ export function deleteUser(userId: string) {
   db.run(`DELETE FROM sync_state WHERE user_id = ?`, [userId]);
   db.run(`DELETE FROM feishu_config WHERE user_id = ?`, [userId]);
   db.run(`DELETE FROM feishu_credentials WHERE user_id = ?`, [userId]);
+  db.run(`DELETE FROM ai_credentials WHERE user_id = ?`, [userId]);
+  db.run(`DELETE FROM ai_cache WHERE user_id = ?`, [userId]);
 }
 
 // ─── 飞书配置 ────────────────────────────────────────
@@ -272,6 +311,72 @@ export function saveFeishuConfig(userId: string, appToken: string, tableId: stri
       app_token = excluded.app_token, table_id = excluded.table_id,
       app_url = excluded.app_url, updated_at = datetime('now')
   `, [userId, appToken, tableId, appUrl ?? null]);
+}
+
+// ─── 飞书文档历史 ────────────────────────────────────
+
+export interface DocHistoryRow {
+  id: number;
+  user_id: string;
+  app_token: string;
+  table_id: string | null;
+  app_url: string | null;
+  name: string | null;
+  is_current: number;
+  created_at: string;
+  deleted_at: string | null;
+}
+
+/** 获取用户的所有文档历史（未删除的） */
+export function getDocHistory(userId: string): DocHistoryRow[] {
+  return getDb().query(
+    `SELECT * FROM feishu_doc_history
+     WHERE user_id = ? AND deleted_at IS NULL
+     ORDER BY is_current DESC, created_at DESC`
+  ).all(userId) as DocHistoryRow[];
+}
+
+/** 添加文档历史记录 */
+export function addDocHistory(
+  userId: string, appToken: string, tableId: string | null,
+  appUrl: string | null, name: string | null, isCurrent: boolean
+) {
+  // 如果标记为当前，先把其他的设为非当前
+  if (isCurrent) {
+    getDb().run(
+      `UPDATE feishu_doc_history SET is_current = 0 WHERE user_id = ?`,
+      [userId]
+    );
+  }
+  getDb().run(
+    `INSERT INTO feishu_doc_history (user_id, app_token, table_id, app_url, name, is_current)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [userId, appToken, tableId, appUrl, name, isCurrent ? 1 : 0]
+  );
+}
+
+/** 标记文档为已删除 */
+export function markDocDeleted(appToken: string) {
+  getDb().run(
+    `UPDATE feishu_doc_history SET deleted_at = datetime('now'), is_current = 0
+     WHERE app_token = ?`,
+    [appToken]
+  );
+}
+
+/** 将当前文档降级为历史文档 */
+export function demoteCurrentDoc(userId: string) {
+  getDb().run(
+    `UPDATE feishu_doc_history SET is_current = 0 WHERE user_id = ? AND is_current = 1`,
+    [userId]
+  );
+}
+
+/** 获取当前文档 */
+export function getCurrentDoc(userId: string): DocHistoryRow | null {
+  return getDb().query(
+    `SELECT * FROM feishu_doc_history WHERE user_id = ? AND is_current = 1 AND deleted_at IS NULL`
+  ).get(userId) as DocHistoryRow | null;
 }
 
 // ─── 飞书凭据（per-user app_id/app_secret） ─────────
@@ -519,6 +624,69 @@ export function getModifiedTasks(userId: string, limit = 20): TaskSearchResult[]
      ORDER BY t.modified_time DESC
      LIMIT ?`
   ).all(userId, limit) as TaskSearchResult[];
+}
+
+// ─── AI 凭据 ─────────────────────────────────────────
+
+export interface AICredentialsRow {
+  user_id: string;
+  api_key: string;
+  model: string;
+  vision_model: string | null;
+}
+
+export function getAICredentials(userId: string): AICredentialsRow | null {
+  return getDb().query(
+    `SELECT user_id, api_key, model, vision_model FROM ai_credentials WHERE user_id = ?`
+  ).get(userId) as AICredentialsRow | null;
+}
+
+export function saveAICredentials(userId: string, apiKey: string, model: string, visionModel?: string) {
+  getDb().run(`
+    INSERT INTO ai_credentials (user_id, api_key, model, vision_model)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT (user_id) DO UPDATE SET
+      api_key = excluded.api_key, model = excluded.model,
+      vision_model = excluded.vision_model, updated_at = datetime('now')
+  `, [userId, apiKey, model, visionModel ?? null]);
+}
+
+export function deleteAICredentials(userId: string) {
+  getDb().run(`DELETE FROM ai_credentials WHERE user_id = ?`, [userId]);
+}
+
+// ─── AI 缓存 ─────────────────────────────────────────
+
+export interface AICacheRow {
+  task_id: string;
+  user_id: string;
+  content_hash: string;
+  ai_title: string | null;
+  ai_summary: string | null;
+}
+
+export function getAICache(userId: string, taskId: string): AICacheRow | null {
+  return getDb().query(
+    `SELECT * FROM ai_cache WHERE user_id = ? AND task_id = ?`
+  ).get(userId, taskId) as AICacheRow | null;
+}
+
+export function saveAICache(
+  userId: string, taskId: string, contentHash: string,
+  aiTitle: string, aiSummary: string,
+) {
+  getDb().run(`
+    INSERT INTO ai_cache (task_id, user_id, content_hash, ai_title, ai_summary)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT (task_id, user_id) DO UPDATE SET
+      content_hash = excluded.content_hash,
+      ai_title = excluded.ai_title, ai_summary = excluded.ai_summary,
+      created_at = datetime('now')
+  `, [taskId, userId, contentHash, aiTitle, aiSummary]);
+}
+
+export function clearAICache(userId: string) {
+  getDb().run(`DELETE FROM ai_cache WHERE user_id = ?`, [userId]);
 }
 
 // ─── 生命周期 ─────────────────────────────────────────

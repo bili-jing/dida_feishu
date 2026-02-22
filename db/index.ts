@@ -148,6 +148,16 @@ function initSchema(db: Database) {
     )
   `);
 
+  db.run(`
+    CREATE TABLE IF NOT EXISTS link_cache (
+      url TEXT PRIMARY KEY,
+      title TEXT,
+      content TEXT,
+      fetched_at TEXT DEFAULT (datetime('now')),
+      status TEXT DEFAULT 'ok'
+    )
+  `);
+
   // 迁移：给旧 tokens 表加 expires_at 列，并回填默认值
   try { db.run(`ALTER TABLE tokens ADD COLUMN expires_at INTEGER`); } catch {}
   db.run(`UPDATE tokens SET expires_at = created_at + 2592000 WHERE expires_at IS NULL`);

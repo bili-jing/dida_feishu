@@ -382,11 +382,25 @@ async function fetchLinkContent(url: string): Promise<{ title: string; content: 
   }
 }
 
+/** 确保 link_cache 表存在 */
+function ensureLinkCacheTable(db: Database) {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS link_cache (
+      url TEXT PRIMARY KEY,
+      title TEXT,
+      content TEXT,
+      fetched_at TEXT DEFAULT (datetime('now')),
+      status TEXT DEFAULT 'ok'
+    )
+  `);
+}
+
 /** 批量处理任务中的链接 */
 async function processLinks(
   db: Database,
   tasks: TaskRow[],
 ): Promise<Map<string, string>> {
+  ensureLinkCacheTable(db);
   const results = new Map<string, string>();
   let fetched = 0, cached = 0, failed = 0, skipped = 0;
 
@@ -1456,7 +1470,12 @@ async function main() {
         await fullSyncUser(db, userId, skipAttachments, limit);
       }
     } catch (e) {
-      console.error(`  同步用户 ${userId} 失败:`, e);
+      const err = e instanceof Error ? e : new Error(String(e));
+      console.error(`  ■ 同步用户 ${userId} 失败: ${err.message}`);
+      if (err.stack) {
+        const stackLines = err.stack.split("\n").slice(1, 5).join("\n");
+        console.error(`  堆栈:\n${stackLines}`);
+      }
     }
   }
 

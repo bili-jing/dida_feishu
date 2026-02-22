@@ -48,16 +48,34 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # 获取上一个 tag
+          PREV_TAG=$(git tag --sort=-creatordate | sed -n '2p')
+          if [ -z "$PREV_TAG" ]; then
+            # 首次发布，取所有 commit
+            LOGS=$(git log --pretty=format:"- %s" -10)
+          else
+            LOGS=$(git log --pretty=format:"- %s" ${PREV_TAG}..HEAD)
+          fi
+          # 写入多行输出
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$LOGS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body: ${{ steps.changelog.outputs.notes }}
           files: |
             dist/dida-feishu-macos
             dist/dida-feishu.exe

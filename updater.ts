@@ -56,7 +56,7 @@ export async function checkForUpdate(): Promise<void> {
       const notes = release.body
         .split("\n")
         .map(l => l.replace(/^#{1,3}\s+/, "").trim())
-        .filter(l => l.length > 0)
+        .filter(l => l.length > 0 && !l.includes("github.com"))
         .slice(0, 10)
         .join("\n");
       if (notes) p.log.message(`更新内容:\n${notes}`);

@@ -138,7 +138,15 @@ async function downloadAndReplace(url: string, version: string): Promise<void> {
     renameSync(tempPath, currentPath);
 
     s.stop(`更新完成！v${APP_VERSION} → v${version}`);
-    p.log.success("请重新启动程序以使用新版本");
+    p.log.success("正在重新启动...");
+
+    // 自动重启：用新二进制替换当前进程
+    const { spawn } = await import("node:child_process");
+    const child = spawn(currentPath, process.argv.slice(2), {
+      stdio: "inherit",
+      detached: true,
+    });
+    child.unref();
     process.exit(0);
   } catch (e) {
     s.stop(`更新失败: ${(e as Error).message}`);

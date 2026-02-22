@@ -17,6 +17,7 @@ import { fullSyncUser, incrementalSyncUser, aiOnlySyncUser } from "./sync.ts";
 import { setFeishuCredentials, clearFeishuCredentials, scanBitables, deleteBitable } from "./feishu/client.ts";
 import { DB_FILE } from "./utils/paths.ts";
 import { checkForUpdate } from "./updater.ts";
+import { APP_VERSION } from "./version.ts";
 
 // ─── 参数解析 ──────────────────────────────────────────
 
@@ -1211,7 +1212,7 @@ async function batchMode(userFilter: string[]) {
 // ─── 主流程 ────────────────────────────────────────────
 
 async function main() {
-  p.intro("滴答清单数据管理");
+  p.intro(`滴答清单数据管理 v${APP_VERSION}`);
 
   await checkForUpdate();
 

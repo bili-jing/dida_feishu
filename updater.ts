@@ -30,6 +30,7 @@ interface ReleaseAsset {
 
 interface ReleaseInfo {
   tag_name: string;
+  body: string;
   assets: ReleaseAsset[];
   html_url: string;
 }
@@ -47,8 +48,22 @@ export async function checkForUpdate(): Promise<void> {
     if (!isNewer(APP_VERSION, release.tag_name)) return;
 
     const remoteVersion = release.tag_name.replace(/^v/, "");
+
+    // 显示更新信息
+    p.log.info(`发现新版本 v${remoteVersion}（当前 v${APP_VERSION}）`);
+    if (release.body) {
+      // 提取更新内容，去掉 markdown 标题符号，限制行数
+      const notes = release.body
+        .split("\n")
+        .map(l => l.replace(/^#{1,3}\s+/, "").trim())
+        .filter(l => l.length > 0)
+        .slice(0, 10)
+        .join("\n");
+      if (notes) p.log.message(`更新内容:\n${notes}`);
+    }
+
     const shouldUpdate = await p.confirm({
-      message: `发现新版本 v${remoteVersion}（当前 v${APP_VERSION}），是否更新？`,
+      message: "是否立即更新？",
     });
     if (!shouldUpdate || typeof shouldUpdate === "symbol") return;
 
@@ -70,12 +85,24 @@ async function downloadAndReplace(url: string, version: string): Promise<void> {
   s.start(`正在下载 v${version}...`);
 
   try {
-    const res = await fetch(url, {
-      signal: AbortSignal.timeout(120000),
-      redirect: "follow",
-    });
-    if (!res.ok) {
+    // 下载，最多重试 2 次（GitHub CDN 偶尔 502）
+    let res: Response | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      res = await fetch(url, {
+        signal: AbortSignal.timeout(120000),
+        redirect: "follow",
+      });
+      if (res.ok) break;
+      if (attempt < 2 && (res.status === 502 || res.status === 503)) {
+        s.message(`下载遇到临时错误 (${res.status})，${attempt + 1}/3 次重试...`);
+        await new Promise(r => setTimeout(r, 3000));
+        continue;
+      }
       s.stop(`下载失败: HTTP ${res.status}`);
+      return;
+    }
+    if (!res || !res.ok) {
+      s.stop("下载失败: 重试次数已用完");
       return;
     }
 

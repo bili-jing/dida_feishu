@@ -16,6 +16,7 @@ import { displayQr } from "./utils/qr.ts";
 import { fullSyncUser, incrementalSyncUser, aiOnlySyncUser } from "./sync.ts";
 import { setFeishuCredentials, clearFeishuCredentials, scanBitables, deleteBitable } from "./feishu/client.ts";
 import { DB_FILE } from "./utils/paths.ts";
+import { checkForUpdate } from "./updater.ts";
 
 // ─── 参数解析 ──────────────────────────────────────────
 
@@ -1212,6 +1213,8 @@ async function batchMode(userFilter: string[]) {
 async function main() {
   p.intro("滴答清单数据管理");
 
+  await checkForUpdate();
+
   const { userFilter } = parseArgs();
   getDb();
 
@@ -1247,7 +1250,13 @@ async function waitBeforeExit() {
 }
 
 main().catch(async (err) => {
-  p.log.error(`运行失败: ${err}`);
+  const errObj = err instanceof Error ? err : new Error(String(err));
+  p.log.error(`运行失败: ${errObj.message}`);
+  if (errObj.stack) {
+    // 只显示前几行堆栈，帮助定位
+    const stackLines = errObj.stack.split("\n").slice(1, 6).join("\n");
+    p.log.warn(`堆栈:\n${stackLines}`);
+  }
   closeDb();
   await waitBeforeExit();
   process.exit(1);

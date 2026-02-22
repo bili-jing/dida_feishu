@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: bun-darwin-arm64
+            outfile: dida-feishu-macos
+          - os: windows-latest
+            target: bun-windows-x64
+            outfile: dida-feishu.exe
+          - os: ubuntu-latest
+            target: bun-linux-x64
+            outfile: dida-feishu-linux
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install
+
+      - name: Build
+        run: bun build --compile --target=${{ matrix.target }} index.ts --outfile dist/${{ matrix.outfile }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.outfile }}
+          path: dist/${{ matrix.outfile }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/dida-feishu-macos
+            dist/dida-feishu.exe
+            dist/dida-feishu-linux

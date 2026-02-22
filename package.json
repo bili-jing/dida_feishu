@@ -1,5 +1,6 @@
 {
   "name": "dida_feishu",
+  "version": "1.0.0",
   "module": "index.ts",
   "type": "module",
   "private": true,
@@ -8,7 +9,7 @@
     "sync": "bun sync.ts",
     "build": "bun run build:win && bun run build:mac",
     "build:win": "bun build --compile --target=bun-windows-x64 index.ts --outfile dist/dida-feishu.exe",
-    "build:mac": "bun build --compile index.ts --outfile dist/dida-feishu-macos",
+    "build:mac": "bun build --compile --target=bun-darwin-arm64 index.ts --outfile dist/dida-feishu-macos",
     "build:linux": "bun build --compile --target=bun-linux-x64 index.ts --outfile dist/dida-feishu-linux"
   },
   "devDependencies": {

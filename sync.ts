@@ -382,25 +382,11 @@ async function fetchLinkContent(url: string): Promise<{ title: string; content: 
   }
 }
 
-/** 确保 link_cache 表存在 */
-function ensureLinkCacheTable(db: Database) {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS link_cache (
-      url TEXT PRIMARY KEY,
-      title TEXT,
-      content TEXT,
-      fetched_at TEXT DEFAULT (datetime('now')),
-      status TEXT DEFAULT 'ok'
-    )
-  `);
-}
-
 /** 批量处理任务中的链接 */
 async function processLinks(
   db: Database,
   tasks: TaskRow[],
 ): Promise<Map<string, string>> {
-  ensureLinkCacheTable(db);
   const results = new Map<string, string>();
   let fetched = 0, cached = 0, failed = 0, skipped = 0;
 
@@ -437,7 +423,7 @@ async function processLinks(
     } else {
       db.run(
         `INSERT OR REPLACE INTO link_cache (url, title, content, status) VALUES (?, '', '', 'failed')`,
-        [link.url, "", ""]
+        [link.url]
       );
       failed++;
     }
@@ -482,7 +468,7 @@ function taskToFields(
   const fields: Record<string, any> = {
     // 有 AI 标题时覆盖原始标题
     内容标题: aiData?.title || displayTitle,
-    类型: classifyType(task),
+    类型: taskType,
     状态: statusText(task.status),
     优先级: priorityText(task.priority),
     所属清单: task.project_name || "",
@@ -813,15 +799,20 @@ async function processAISummaries(
   const results = new Map<string, { title: string; summary: string }>();
   let processed = 0, cached = 0, skipped = 0, failed = 0;
 
-  for (let i = 0; i < tasks.length; i++) {
-    const task = tasks[i];
-    const taskType = classifyType(task);
+  // 1. 先过滤：缓存命中和不需要 AI 的直接跳过
+  interface PendingTask {
+    task: TaskRow;
+    taskType: string;
+    hash: string;
+    fullText: string;
+  }
+  const pending: PendingTask[] = [];
 
-    // 有链接内容时放宽 AI 条件（链接类型也需要 AI）
+  for (const task of tasks) {
+    const taskType = classifyType(task);
     const hasLinkContent = linkContents?.has(task.id);
     if (!hasLinkContent && !needsAI(task, taskType)) { skipped++; continue; }
 
-    // 缓存检测：将链接内容也纳入 hash
     const linkText = linkContents?.get(task.id) || "";
     const inputText = (task.content || task.title || "") + linkText;
     const hash = contentHash(inputText);
@@ -835,51 +826,101 @@ async function processAISummaries(
       continue;
     }
 
-    // 调用 AI
-    try {
-      const cleaned = cleanContent(task.content);
-      // 加入链接抓取的内容，让 AI 有更多素材
-      const fullText = (cleaned || task.title) + (linkText ? "\n\n链接正文：\n" + linkText.slice(0, 3000) : "");
-      let aiResult: { title: string; summary: string };
+    const cleaned = cleanContent(task.content);
+    const fullText = (cleaned || task.title) + (linkText ? "\n\n链接正文：\n" + linkText.slice(0, 3000) : "");
+    pending.push({ task, taskType, hash, fullText });
+  }
 
-      // 图片类型：尝试视觉模型
-      if (taskType === "图片" && aiConfig.visionModel) {
-        const firstImage = parseAttachments(task.raw).find(a => a.fileType === "IMAGE");
-        const localPath = firstImage
-          ? (db.query(`SELECT local_path FROM attachment_cache WHERE attachment_id = ?`).get(firstImage.id) as any)?.local_path
-          : null;
-        if (localPath && existsSync(localPath)) {
-          const buf = Buffer.from(await Bun.file(localPath).arrayBuffer());
-          const ext = firstImage!.fileName.split(".").pop()?.toLowerCase();
-          const mime = ext === "png" ? "image/png" : "image/jpeg";
-          aiResult = await describeImage(aiConfig, buf.toString("base64"), mime);
+  console.log(`  AI: 需处理=${pending.length} 缓存=${cached} 跳过=${skipped}`);
+
+  if (pending.length === 0) {
+    console.log(`  AI处理完成: 生成=${processed} 缓存=${cached} 跳过=${skipped} 失败=${failed}`);
+    return results;
+  }
+
+  // 2. 并发处理（渐进爬坡：10 → 25 → 50 → 100）
+  // 豆包 API 限流：标准模型 10K RPM / 800K TPM，100 并发完全在限制内
+  const MAX_CONCURRENCY = 100;
+  let activeWorkers = 0;
+  let index = 0;
+
+  // 完成信号：所有任务处理完毕时 resolve
+  let resolveAll: () => void;
+  const allDone = new Promise<void>(r => { resolveAll = r; });
+
+  function checkDone() {
+    if (activeWorkers === 0 && index >= pending.length) resolveAll();
+  }
+
+  async function worker() {
+    activeWorkers++;
+    while (index < pending.length) {
+      const i = index++;
+      const { task, taskType, hash, fullText } = pending[i];
+
+      try {
+        let aiResult: { title: string; summary: string };
+
+        if (taskType === "图片" && aiConfig.visionModel) {
+          const firstImage = parseAttachments(task.raw).find(a => a.fileType === "IMAGE");
+          const localPath = firstImage
+            ? (db.query(`SELECT local_path FROM attachment_cache WHERE attachment_id = ?`).get(firstImage.id) as any)?.local_path
+            : null;
+          if (localPath && existsSync(localPath)) {
+            const buf = Buffer.from(await Bun.file(localPath).arrayBuffer());
+            const ext = firstImage!.fileName.split(".").pop()?.toLowerCase();
+            const mime = ext === "png" ? "image/png" : "image/jpeg";
+            aiResult = await describeImage(aiConfig, buf.toString("base64"), mime);
+          } else {
+            aiResult = await summarizeTask(aiConfig, fullText, taskType);
+          }
         } else {
           aiResult = await summarizeTask(aiConfig, fullText, taskType);
         }
-      } else {
-        aiResult = await summarizeTask(aiConfig, fullText, taskType);
+
+        results.set(task.id, aiResult);
+        db.run(`
+          INSERT INTO ai_cache (task_id, user_id, content_hash, ai_title, ai_summary)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT (task_id, user_id) DO UPDATE SET
+            content_hash = excluded.content_hash, ai_title = excluded.ai_title,
+            ai_summary = excluded.ai_summary, created_at = datetime('now')
+        `, [task.id, userId, hash, aiResult.title, aiResult.summary]);
+        processed++;
+      } catch (e) {
+        console.warn(`  ⚠ AI处理失败 [${task.id}]:`, (e as Error).message);
+        failed++;
       }
 
-      results.set(task.id, aiResult);
-      db.run(`
-        INSERT INTO ai_cache (task_id, user_id, content_hash, ai_title, ai_summary)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT (task_id, user_id) DO UPDATE SET
-          content_hash = excluded.content_hash, ai_title = excluded.ai_title,
-          ai_summary = excluded.ai_summary, created_at = datetime('now')
-      `, [task.id, userId, hash, aiResult.title, aiResult.summary]);
-      processed++;
-
-      if ((processed + failed) % 10 === 0) {
-        console.log(`  AI: ${i + 1}/${tasks.length} (完成=${processed} 缓存=${cached} 跳过=${skipped} 失败=${failed})`);
+      const done = processed + failed;
+      if (done % 50 === 0 || done === pending.length) {
+        console.log(`  AI: ${done}/${pending.length} (完成=${processed} 失败=${failed})`);
       }
-      // 限流 ~5 QPS
-      await sleep(200);
-    } catch (e) {
-      console.warn(`  ⚠ AI处理失败 [${task.id}]:`, (e as Error).message);
-      failed++;
     }
+    activeWorkers--;
+    checkDone();
   }
+
+  // 启动初始 10 个 worker
+  const initialWorkers = Math.min(10, pending.length);
+  for (let w = 0; w < initialWorkers; w++) worker();
+
+  // 爬坡定时器：每 2 秒扩容，10 → 25 → 50 → 100
+  const rampSteps = [25, 50, MAX_CONCURRENCY];
+  let rampIndex = 0;
+  const rampTimer = setInterval(() => {
+    if (rampIndex >= rampSteps.length || index >= pending.length) {
+      clearInterval(rampTimer);
+      return;
+    }
+    const target = Math.min(rampSteps[rampIndex], pending.length - index + activeWorkers);
+    const newWorkers = target - activeWorkers;
+    for (let w = 0; w < newWorkers && w >= 0; w++) worker();
+    rampIndex++;
+  }, 2000);
+
+  await allDone;
+  clearInterval(rampTimer);
 
   console.log(`  AI处理完成: 生成=${processed} 缓存=${cached} 跳过=${skipped} 失败=${failed}`);
   return results;
@@ -1036,8 +1077,13 @@ export async function fullSyncUser(db: Database, userId: string, skipAttachments
   }
 
   // 5.5. 处理链接内容
+  let linkContents = new Map<string, string>();
   console.log("  处理链接内容...");
-  const linkContents = await processLinks(db, tasks);
+  try {
+    linkContents = await processLinks(db, tasks);
+  } catch (e) {
+    console.warn("  ⚠ 链接处理失败，继续同步:", (e as Error).message);
+  }
 
   // 6. AI 摘要处理
   let aiResults = new Map<string, { title: string; summary: string }>();
@@ -1176,8 +1222,13 @@ export async function incrementalSyncUser(
   }
 
   // 处理链接内容
+  let linkContents = new Map<string, string>();
   console.log("  处理链接内容...");
-  const linkContents = await processLinks(db, changedTasks);
+  try {
+    linkContents = await processLinks(db, changedTasks);
+  } catch (e) {
+    console.warn("  ⚠ 链接处理失败，继续同步:", (e as Error).message);
+  }
 
   // AI 摘要处理
   let aiResults = new Map<string, { title: string; summary: string }>();
@@ -1294,8 +1345,13 @@ export async function aiOnlySyncUser(db: Database, userId: string, limit = 0) {
   console.log(`  已同步记录: ${syncMap.size} 条`);
 
   // 1. 处理链接内容
+  let linkContents = new Map<string, string>();
   console.log("  处理链接内容...");
-  const linkContents = await processLinks(db, tasks);
+  try {
+    linkContents = await processLinks(db, tasks);
+  } catch (e) {
+    console.warn("  ⚠ 链接处理失败，继续同步:", (e as Error).message);
+  }
 
   // 2. 处理 AI 摘要
   console.log("  处理 AI 摘要...");

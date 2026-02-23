@@ -773,19 +773,33 @@ async function docManagementMenu(userId: string) {
     }
   }
 
-  // 显示一次性提示
-  if (merged.some(d => d.source === "local")) {
-    const localOnly = merged.filter(d => d.source === "local");
-    p.log.warn(`${localOnly.length} 个本地记录的文档在云空间中未找到（可能已手动删除）`);
+  // 自动清理本地孤儿记录（云端已不存在）
+  const localOnly = merged.filter(d => d.source === "local");
+  if (localOnly.length > 0) {
+    for (const d of localOnly) markDocDeleted(d.token);
+    merged.splice(0, merged.length, ...merged.filter(d => d.source !== "local"));
+    p.log.info(`已自动清理 ${localOnly.length} 个失效记录（云端已不存在）`);
+  }
+
+  if (merged.length === 0) {
+    p.log.info("没有有效的飞书文档");
+    return;
+  }
+
+  // 直接打印文档列表
+  for (const d of merged) {
+    const prefix = d.isCurrent ? "★" : " ";
+    const date = d.created_time ? formatTime(d.created_time) : "";
+    const url = d.url || "无链接";
+    p.log.info(`${prefix} ${d.name}  ${date}  ${url}`);
   }
 
   while (true) {
     const options: Array<{ value: string; label: string; hint?: string }> = merged
-      .filter(d => d.source !== "local")
       .map(d => ({
         value: d.token,
         label: `${d.isCurrent ? "★ " : "  "}${d.name}`,
-        hint: `${d.isCurrent ? "当前使用" : ""}${d.created_time ? ` ${formatTime(d.created_time)}` : ""}`,
+        hint: d.isCurrent ? "当前使用" : "",
       }));
 
     options.push({ value: "__batch_delete__", label: "批量删除非当前文档" });
@@ -797,7 +811,7 @@ async function docManagementMenu(userId: string) {
     if (choice === "__back__") return;
 
     if (choice === "__batch_delete__") {
-      const nonCurrent = merged.filter(d => !d.isCurrent && d.source !== "local");
+      const nonCurrent = merged.filter(d => !d.isCurrent);
       if (nonCurrent.length === 0) {
         p.log.info("没有可删除的历史文档");
         continue;
@@ -825,8 +839,7 @@ async function docManagementMenu(userId: string) {
       }
       ds.stop(`已删除 ${deleted} 个文档`);
 
-      // 刷新列表
-      merged.splice(0, merged.length, ...merged.filter(d => d.isCurrent || !nonCurrent.includes(d)));
+      merged.splice(0, merged.length, ...merged.filter(d => d.isCurrent));
       continue;
     }
 
@@ -885,14 +898,15 @@ async function promptDeleteOldDoc(userId: string): Promise<boolean> {
   if (choice === "cancel") return false;
 
   if (choice === "delete") {
+    const s = p.spinner();
+    s.start("删除旧表格...");
     try {
-      const s = p.spinner();
-      s.start("删除旧表格...");
       await deleteBitable(config.app_token);
       markDocDeleted(config.app_token);
       s.stop("旧表格已删除（可在飞书回收站恢复）");
     } catch (e) {
-      p.log.warn(`删除旧表格失败: ${(e as Error).message}，将保留旧表格继续重建`);
+      s.stop("删除旧表格失败");
+      p.log.warn(`${(e as Error).message}，将保留旧表格继续重建`);
     }
   }
 

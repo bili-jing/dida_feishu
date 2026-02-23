@@ -26,36 +26,48 @@ interface ChatCompletionResponse {
   usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
 }
 
-/** 调用 Chat Completions API */
+/** 调用 Chat Completions API（含 429 重试 + 指数退避） */
 async function chatCompletion(
   config: AIConfig,
   messages: ChatMessage[],
   options?: { model?: string; maxTokens?: number; temperature?: number },
 ): Promise<string> {
   const model = options?.model ?? config.model;
+  const MAX_RETRIES = 3;
 
-  const res = await fetch(`${ARK_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      max_tokens: options?.maxTokens ?? 300,
-      temperature: options?.temperature ?? 0.3,
-    }),
-    signal: AbortSignal.timeout(30_000),
-  });
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const res = await fetch(`${ARK_BASE}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        max_tokens: options?.maxTokens ?? 300,
+        temperature: options?.temperature ?? 0.3,
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Doubao API ${res.status}: ${text.slice(0, 200)}`);
+    if (res.status === 429 && attempt < MAX_RETRIES) {
+      // 指数退避 + 随机抖动，避免高并发下 thundering herd
+      const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
+      await new Promise(r => setTimeout(r, delay));
+      continue;
+    }
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Doubao API ${res.status}: ${text.slice(0, 200)}`);
+    }
+
+    const data = (await res.json()) as ChatCompletionResponse;
+    return data.choices[0]?.message?.content?.trim() ?? "";
   }
-
-  const data = (await res.json()) as ChatCompletionResponse;
-  return data.choices[0]?.message?.content?.trim() ?? "";
+  // 理论上不可达：循环内每条路径都会 return 或 throw
+  throw new Error("Doubao API: max retries exceeded");
 }
 
 /** 从 AI 响应中提取 JSON */

@@ -553,6 +553,48 @@ function batchUpsertSyncState(
   })();
 }
 
+/** 批量更新，遇到 record not found 时自动剔除并重试整个批次 */
+async function batchUpdateWithRetry(
+  appToken: string,
+  tableId: string,
+  records: Array<{ record_id: string; fields: Record<string, any> }>
+): Promise<{ updated: any[]; deletedRecordIds: Set<string> }> {
+  const deletedRecordIds = new Set<string>();
+  let remaining = records;
+
+  while (remaining.length > 0) {
+    try {
+      const result = await batchUpdateRecords(appToken, tableId, remaining);
+      return { updated: result, deletedRecordIds };
+    } catch (err: any) {
+      const msg = err?.message ?? "";
+      const match = msg.match(/record not found[,，]\s*id\s*=\s*(\S+)/i);
+      if (!match) throw err;
+
+      const badId = match[1];
+      deletedRecordIds.add(badId);
+      remaining = remaining.filter((r) => r.record_id !== badId);
+      console.log(`  ⚠ 飞书记录 ${badId} 已不存在，已剔除（剩余 ${remaining.length} 条）`);
+
+      if (remaining.length === 0) break;
+      await sleep(300);
+    }
+  }
+
+  return { updated: [], deletedRecordIds };
+}
+
+function markSyncStateDeletedRemote(db: Database, userId: string, taskIds: string[]) {
+  const stmt = db.prepare(
+    `UPDATE sync_state SET sync_status = 'deleted_remote', last_synced_at = datetime('now') WHERE dida_task_id = ? AND user_id = ?`
+  );
+  db.transaction(() => {
+    for (const id of taskIds) {
+      stmt.run(id, userId);
+    }
+  })();
+}
+
 // ─── 附件缓存 DB ─────────────────────────────────────
 
 function getCachedFileToken(db: Database, attachmentId: string): string | null {
@@ -758,11 +800,11 @@ export function getFeishuConfigFromDb(db: Database, userId: string) {
 
 function getSyncStateMap(db: Database, userId: string) {
   const rows = db
-    .query(`SELECT dida_task_id, feishu_record_id, last_modified_time FROM sync_state WHERE user_id = ?`)
-    .all(userId) as Array<{ dida_task_id: string; feishu_record_id: string; last_modified_time: string | null }>;
-  const map = new Map<string, { recordId: string; modifiedTime: string | null }>();
+    .query(`SELECT dida_task_id, feishu_record_id, last_modified_time, sync_status FROM sync_state WHERE user_id = ?`)
+    .all(userId) as Array<{ dida_task_id: string; feishu_record_id: string; last_modified_time: string | null; sync_status: string }>;
+  const map = new Map<string, { recordId: string; modifiedTime: string | null; syncStatus: string }>();
   for (const r of rows) {
-    map.set(r.dida_task_id, { recordId: r.feishu_record_id, modifiedTime: r.last_modified_time });
+    map.set(r.dida_task_id, { recordId: r.feishu_record_id, modifiedTime: r.last_modified_time, syncStatus: r.sync_status });
   }
   return map;
 }
@@ -779,10 +821,13 @@ function needsAI(task: TaskRow, taskType: string): boolean {
   return true;
 }
 
-/** 计算内容哈希 */
+/** AI 处理版本号，处理逻辑变更时递增以自动失效旧缓存 */
+const AI_PROCESSING_VERSION = "v2";
+
+/** 计算内容哈希（含处理版本号） */
 function contentHash(text: string): string {
   const hasher = new Bun.CryptoHasher("md5");
-  hasher.update(text);
+  hasher.update(AI_PROCESSING_VERSION + text);
   return hasher.digest("hex");
 }
 
@@ -795,7 +840,7 @@ async function processAISummaries(
   linkContents?: Map<string, string>,
   forceReprocess = false,
 ): Promise<Map<string, { title: string; summary: string }>> {
-  const { summarizeTask, describeImage } = await import("./ai/client.ts");
+  const { summarizeTask, describeImage, summarizeDocument } = await import("./ai/client.ts");
   const results = new Map<string, { title: string; summary: string }>();
   let processed = 0, cached = 0, skipped = 0, failed = 0;
 
@@ -871,6 +916,44 @@ async function processAISummaries(
             const ext = firstImage!.fileName.split(".").pop()?.toLowerCase();
             const mime = ext === "png" ? "image/png" : "image/jpeg";
             aiResult = await describeImage(aiConfig, buf.toString("base64"), mime);
+          } else {
+            aiResult = await summarizeTask(aiConfig, fullText, taskType);
+          }
+        } else if (taskType === "文件" || taskType === "图文混合") {
+          const attachments = parseAttachments(task.raw);
+          const docAtt = attachments.find(a => {
+            const ext = a.fileName.split(".").pop()?.toLowerCase() ?? "";
+            return ["pdf", "txt", "csv"].includes(ext);
+          });
+          const localPath = docAtt
+            ? (db.query(`SELECT local_path FROM attachment_cache WHERE attachment_id = ?`).get(docAtt.id) as any)?.local_path
+            : null;
+          const ext = docAtt?.fileName.split(".").pop()?.toLowerCase();
+          if (localPath && existsSync(localPath) && ext === "pdf") {
+            try {
+              const pdfParse = require("pdf-parse");
+              const buf = Buffer.from(await Bun.file(localPath).arrayBuffer());
+              const pdf = await pdfParse(buf);
+              const pdfText = pdf.text?.trim();
+              if (pdfText && pdfText.length > 20) {
+                aiResult = await summarizeDocument(aiConfig, pdfText);
+              } else {
+                aiResult = await summarizeTask(aiConfig, fullText, taskType);
+              }
+            } catch {
+              aiResult = await summarizeTask(aiConfig, fullText, taskType);
+            }
+          } else if (localPath && existsSync(localPath) && (ext === "txt" || ext === "csv")) {
+            try {
+              const textContent = await Bun.file(localPath).text();
+              if (textContent.trim().length > 20) {
+                aiResult = await summarizeDocument(aiConfig, textContent);
+              } else {
+                aiResult = await summarizeTask(aiConfig, fullText, taskType);
+              }
+            } catch {
+              aiResult = await summarizeTask(aiConfig, fullText, taskType);
+            }
           } else {
             aiResult = await summarizeTask(aiConfig, fullText, taskType);
           }
@@ -1186,15 +1269,18 @@ export async function incrementalSyncUser(
   const syncMap = getSyncStateMap(db, userId);
   console.log(`  已同步记录: ${syncMap.size} 条`);
 
-  // 分类：新增 / 修改 / 未变
+  // 分类：新增 / 修改 / 未变 / 远程已删除(跳过)
   const newTasks: TaskRow[] = [];
   const modifiedTasks: Array<{ task: TaskRow; recordId: string }> = [];
   let unchanged = 0;
+  let skippedDeleted = 0;
 
   for (const task of tasks) {
     const existing = syncMap.get(task.id);
     if (!existing) {
       newTasks.push(task);
+    } else if (existing.syncStatus === "deleted_remote") {
+      skippedDeleted++;
     } else if (task.modified_time !== existing.modifiedTime) {
       modifiedTasks.push({ task, recordId: existing.recordId });
     } else {
@@ -1203,7 +1289,8 @@ export async function incrementalSyncUser(
   }
 
   console.log(
-    `  新增: ${newTasks.length} | 修改: ${modifiedTasks.length} | 未变: ${unchanged}`
+    `  新增: ${newTasks.length} | 修改: ${modifiedTasks.length} | 未变: ${unchanged}` +
+    (skippedDeleted > 0 ? ` | 飞书端已删除跳过: ${skippedDeleted}` : "")
   );
 
   if (newTasks.length === 0 && modifiedTasks.length === 0) {
@@ -1273,16 +1360,30 @@ export async function incrementalSyncUser(
         fields: taskToFields(task, fileTokens.length > 0 ? fileTokens : undefined, aiResults.get(task.id), linkContents.get(task.id)),
       };
     });
-    const updated = await batchUpdateRecords(appToken, tableId, updateRecords);
+
+    const { updated, deletedRecordIds } = await batchUpdateWithRetry(appToken, tableId, updateRecords);
     console.log(`  成功更新 ${updated.length} 条`);
 
-    // 更新同步状态
-    const syncItems = modifiedTasks.map(({ task, recordId }) => ({
-      taskId: task.id,
-      recordId,
-      modifiedTime: task.modified_time,
-    }));
-    batchUpsertSyncState(db, userId, syncItems);
+    // 更新成功记录的同步状态
+    const succeededItems = modifiedTasks
+      .filter((m) => !deletedRecordIds.has(m.recordId))
+      .map(({ task, recordId }) => ({
+        taskId: task.id,
+        recordId,
+        modifiedTime: task.modified_time,
+      }));
+    if (succeededItems.length > 0) {
+      batchUpsertSyncState(db, userId, succeededItems);
+    }
+
+    // 飞书端已删除的记录，标记为 deleted_remote，后续同步不再处理
+    if (deletedRecordIds.size > 0) {
+      const deletedTaskIds = modifiedTasks
+        .filter((m) => deletedRecordIds.has(m.recordId))
+        .map((m) => m.task.id);
+      console.log(`  ⚠ ${deletedTaskIds.length} 条记录在飞书端已被删除，已标记跳过，后续不再同步`);
+      markSyncStateDeletedRemote(db, userId, deletedTaskIds);
+    }
   }
 
   console.log(`\n  ✓ 增量同步完成！`);
@@ -1362,7 +1463,7 @@ export async function aiOnlySyncUser(db: Database, userId: string, limit = 0) {
 
   for (const task of tasks) {
     const existing = syncMap.get(task.id);
-    if (!existing) continue; // 没有 record_id，跳过
+    if (!existing || existing.syncStatus === "deleted_remote") continue;
 
     const aiData = aiResults.get(task.id);
     const linkContent = linkContents.get(task.id);
@@ -1401,7 +1502,18 @@ export async function aiOnlySyncUser(db: Database, userId: string, limit = 0) {
 
   // 4. 批量更新
   console.log(`  更新 ${updates.length} 条记录的 AI 字段...`);
-  const updated = await batchUpdateRecords(config.app_token, config.table_id, updates);
+  const { updated, deletedRecordIds } = await batchUpdateWithRetry(config.app_token, config.table_id, updates);
+
+  if (deletedRecordIds.size > 0) {
+    const failedTaskIds = [...syncMap.entries()]
+      .filter(([, v]) => deletedRecordIds.has(v.recordId))
+      .map(([taskId]) => taskId);
+    if (failedTaskIds.length > 0) {
+      console.log(`  ⚠ ${failedTaskIds.length} 条记录在飞书端已被删除，已标记跳过`);
+      markSyncStateDeletedRemote(db, userId, failedTaskIds);
+    }
+  }
+
   console.log(`  成功更新 ${updated.length} 条`);
 
   console.log(`\n  ✓ AI 增量更新完成！`);

@@ -14,7 +14,7 @@ export interface AIConfig {
 
 interface ChatMessage {
   role: "system" | "user" | "assistant";
-  content: string | Array<{ type: string; text?: string; image_url?: { url: string } }>;
+  content: string | Array<{ type: string; text?: string; image_url?: { url: string }; file_url?: { url: string } }>;
 }
 
 interface ChatCompletionResponse {
@@ -131,6 +131,20 @@ export async function describeImage(
     ],
     { model: config.visionModel, maxTokens: 300 },
   );
+
+  return parseAIJson(result);
+}
+
+/** 为文档文本内容生成摘要 */
+export async function summarizeDocument(
+  config: AIConfig,
+  textContent: string,
+): Promise<{ title: string; summary: string }> {
+  const trimmed = textContent.slice(0, 6000);
+  const result = await chatCompletion(config, [
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: `内容类型: 文档\n\n${trimmed}` },
+  ], { maxTokens: 300 });
 
   return parseAIJson(result);
 }

@@ -238,6 +238,33 @@ export async function batchUpdateRecords(
   return results;
 }
 
+/** 获取数据表中所有记录的 record_id 集合 */
+export async function listRecordIds(
+  appToken: string,
+  tableId: string
+): Promise<Set<string>> {
+  const client = getFeishuClient();
+  const ids = new Set<string>();
+  let pageToken: string | undefined;
+
+  do {
+    const res = await client.bitable.appTableRecord.list({
+      path: { app_token: appToken, table_id: tableId },
+      params: {
+        page_size: 500,
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
+    });
+    if (res.code !== 0) throw new Error(`获取记录列表失败: ${res.msg}`);
+    for (const r of res.data?.items ?? []) {
+      if (r.record_id) ids.add(r.record_id);
+    }
+    pageToken = res.data?.page_token ?? undefined;
+  } while (pageToken);
+
+  return ids;
+}
+
 /** 获取多维表格信息 */
 export async function getBitableInfo(appToken: string) {
   const client = getFeishuClient();

@@ -22,6 +22,7 @@
   "dependencies": {
     "@clack/prompts": "^1.0.1",
     "@larksuiteoapi/node-sdk": "^1.59.0",
+    "pdf-parse": "1.1.1",
     "qrcode": "^1.5.4"
   }
 }

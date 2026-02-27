@@ -1,8 +1,26 @@
 import * as p from "@clack/prompts";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { APP_VERSION } from "./version.ts";
 
 const REPO = "bili-jing/dida_feishu";
 const API_URL = `https://api.github.com/repos/${REPO}/releases/latest`;
+
+const CLOUD_SYNC_PATTERNS: Array<[RegExp, string]> = [
+  [/nutstore|坚果云|\.nutstore/i, "坚果云"],
+  [/dropbox/i, "Dropbox"],
+  [/onedrive/i, "OneDrive"],
+  [/icloud|Mobile Documents/i, "iCloud"],
+  [/google\s*drive/i, "Google Drive"],
+];
+
+/** Detect if a file path is inside a cloud sync directory */
+export function detectCloudSync(filePath: string): string | null {
+  for (const [pattern, name] of CLOUD_SYNC_PATTERNS) {
+    if (pattern.test(filePath)) return name;
+  }
+  return null;
+}
 
 /** Compare semver: is remote newer than local? */
 export function isNewer(local: string, remote: string): boolean {
@@ -52,7 +70,6 @@ export async function checkForUpdate(): Promise<void> {
     // 显示更新信息
     p.log.info(`发现新版本 v${remoteVersion}（当前 v${APP_VERSION}）`);
     if (release.body) {
-      // 提取更新内容，去掉 markdown 标题符号，限制行数
       const notes = release.body
         .split("\n")
         .map(l => l.replace(/^#{1,3}\s+/, "").trim())
@@ -83,9 +100,9 @@ export async function checkForUpdate(): Promise<void> {
 async function downloadAndReplace(url: string, version: string): Promise<void> {
   const s = p.spinner();
   s.start(`正在下载 v${version}...`);
+  let tempPath = "";
 
   try {
-    // 下载，最多重试 2 次（GitHub CDN 偶尔 502）
     let res: Response | null = null;
     for (let attempt = 0; attempt < 3; attempt++) {
       res = await fetch(url, {
@@ -109,38 +126,53 @@ async function downloadAndReplace(url: string, version: string): Promise<void> {
     const data = await res.arrayBuffer();
     const currentPath = process.execPath;
 
-    // Dev mode (running via bun) — skip replacement
     const execName = currentPath.split(/[/\\]/).pop()?.toLowerCase() ?? "";
     if (execName === "bun" || execName === "bun.exe") {
       s.stop(`开发模式下跳过替换（已下载 ${(data.byteLength / 1024 / 1024).toFixed(1)} MB）`);
       return;
     }
 
-    const oldPath = currentPath + ".old";
-    const tempPath = currentPath + ".new";
+    const cloudService = detectCloudSync(currentPath);
+    if (cloudService) {
+      s.stop("");
+      p.log.warn(
+        `检测到程序位于「${cloudService}」同步目录中。\n` +
+        `  更新过程将采用安全模式，但仍建议将程序移出同步目录使用。`
+      );
+      s.start("正在安全更新...");
+    }
 
-    // Write to temp file first
+    // 在系统临时目录中完成下载和权限设置，避免在同步目录中产生中间文件
+    tempPath = join(tmpdir(), `dida-feishu-update-${Date.now()}`);
     await Bun.write(tempPath, data);
 
     if (process.platform !== "win32") {
-      // macOS/Linux: chmod +x and remove quarantine
       const { $ } = Bun;
       await $`chmod +x ${tempPath}`.quiet();
       if (process.platform === "darwin") {
-        await $`xattr -cr ${tempPath}`.quiet().nothrow();
+        // 仅清除 quarantine 隔离属性，保留其他 xattr（如云同步元数据）
+        await $`xattr -d com.apple.quarantine ${tempPath}`.quiet().nothrow();
       }
     }
 
-    // Swap: current → .old, temp → current
-    const { renameSync, unlinkSync } = await import("node:fs");
-    try { unlinkSync(oldPath); } catch {} // clean up any previous .old
+    // 在目标目录中只做最少的文件操作（rename + copy），避免触发大量同步事件
+    const oldPath = currentPath + ".old";
+    const { renameSync, unlinkSync, copyFileSync, chmodSync } = await import("node:fs");
+
+    try { unlinkSync(oldPath); } catch {}
     renameSync(currentPath, oldPath);
-    renameSync(tempPath, currentPath);
+    copyFileSync(tempPath, currentPath);
+
+    if (process.platform !== "win32") {
+      chmodSync(currentPath, 0o755);
+    }
+
+    // 清理临时文件（在系统临时目录中，不影响同步）
+    try { unlinkSync(tempPath); } catch {}
 
     s.stop(`更新完成！v${APP_VERSION} → v${version}`);
     p.log.success("正在重新启动...");
 
-    // 自动重启：用新二进制替换当前进程
     const { spawn } = await import("node:child_process");
     const child = spawn(currentPath, process.argv.slice(2), {
       stdio: "inherit",
@@ -150,13 +182,13 @@ async function downloadAndReplace(url: string, version: string): Promise<void> {
     process.exit(0);
   } catch (e) {
     s.stop(`更新失败: ${(e as Error).message}`);
-    // Try to restore from .old if swap was partial
     try {
-      const { existsSync, renameSync } = await import("node:fs");
+      const { existsSync, renameSync, unlinkSync } = await import("node:fs");
       const currentPath = process.execPath;
       if (!existsSync(currentPath) && existsSync(currentPath + ".old")) {
         renameSync(currentPath + ".old", currentPath);
       }
+      if (tempPath) try { unlinkSync(tempPath); } catch {}
     } catch {}
   }
 }
